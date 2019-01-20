@@ -38,7 +38,7 @@ void convRef(T *output, const T *input, const T *weight, const T *bias, bool rel
                     {
                         for (int s = 0; s < S; s++)
                         {
-                            for (int r = 0; r < S; r++)
+                            for (int r = 0; r < R; r++)
                             {
                                 float filter = (float)(weight[FILTER_IDX_NCHW(k, c, s, r)]);
                                 int y = h + s - S / 2;
@@ -70,7 +70,7 @@ void cudnnConvTest(T *output, T *input, T *filter, T *bias, bool relu)
 {
     bool fp16 = (sizeof(T) == sizeof(half));
     const cudnnDataType_t datatype = fp16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
-    const cudnnTensorFormat_t format = CUDNN_TENSOR_NCHW;
+    const cudnnTensorFormat_t layout = fp16 ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
 
     cudnnHandle_t cudnnHandle;
     cudnnTensorDescriptor_t inputTensor, filterTensor, outputTensor, biasDesc;
@@ -90,20 +90,20 @@ void cudnnConvTest(T *output, T *input, T *filter, T *bias, bool relu)
     status = cudnnCreateActivationDescriptor(&actDesc);
 
     status = cudnnSetTensor4dDescriptor(inputTensor,
-        format,
+        layout,
         datatype,
         N, C,
         H, W);
 
     status = cudnnSetFilter4dDescriptor(filterDesc,
         datatype,
-        format,
+        layout,
         K,
         C,
         S,
         R);
 
-    status = cudnnSetTensor4dDescriptor(biasDesc, format, datatype, 1, K, 1, 1);
+    status = cudnnSetTensor4dDescriptor(biasDesc, layout, datatype, 1, K, 1, 1);
 
     status = cudnnSetActivationDescriptor(actDesc, relu ? CUDNN_ACTIVATION_RELU : CUDNN_ACTIVATION_IDENTITY, CUDNN_NOT_PROPAGATE_NAN, 0.0);
 
@@ -123,7 +123,7 @@ void cudnnConvTest(T *output, T *input, T *filter, T *bias, bool relu)
 
 
     status = cudnnSetTensor4dDescriptor(outputTensor,
-        format,
+        layout,
         datatype,
         n, c,
         h, w);
@@ -192,13 +192,156 @@ void cudnnConvTest(T *output, T *input, T *filter, T *bias, bool relu)
     cudnnDestroy(cudnnHandle);
 }
 
+// simplest naive kernel for convolution
+// no. of threads = no of output element
+// no shared memory used, no data reuse, etc
+#if 0
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+__global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    int n = blockIdx.y;
+    int k = blockIdx.x;
 
+    int h = threadIdx.y;
+    int w = threadIdx.x;
+
+    float op = 0.0f;
+    //#pragma unroll 16
+    for (int c = 0; c < C; c++)
+    {
+        #pragma unroll
+        for (int s = 0; s < S; s++)
+        {
+            #pragma unroll
+            for (int r = 0; r < R; r++)
+            {
+                float filter = (float)(weight[FILTER_IDX_NCHW(k, c, s, r)]);
+                int y = h + s - S / 2;
+                int x = w + r - R / 2;
+                float ip = 0;
+                if (y >= 0 && y < H && x >= 0 && x < W)
+                    ip = (float)(input[INDEX_NCHW(n, c, y, x)]);
+                op += ip * filter;
+            }   // r
+        }   // s
+    }   // c
+
+    if (bias)
+        op += (float)(bias[k]);
+
+    if (relu && op < 0)
+        op = 0;
+
+    output[INDEX_NCHW(n, k, h, w)] = (T)op;
+}
+#endif
+
+#if 1
+// simple opt, store filter in shared memory
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+__global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    int n = blockIdx.y;
+    int k = blockIdx.x;
+
+    int h = threadIdx.y;
+    int w = threadIdx.x;
+
+    int threadInBlock = h*W + w;
+    int laneIndex = threadInBlock & 0x1F;
+
+    // the usage pattern here is more like __constant__ memory, 
+    // but we don't have enough to store 256x256x3x3 filter data
+    __shared__ T shFilter[C*R*S];
+
+    for (int i = 0; i < C*R*S / (H*W); i++)
+    {
+        int localIndex = (H*W)*i + threadInBlock;
+        shFilter[localIndex] = weight[k * (C*R*S) + localIndex];
+    }
+
+    __syncthreads();
+
+    float op = 0.0f;
+    #pragma unroll 8
+    for (int c = 0; c < C; c++)
+    {
+        #pragma unroll
+        for (int s = 0; s < S; s++)
+        {
+            #pragma unroll
+            for (int r = 0; r < R; r++)
+            {
+                float filter = 0;
+                if (laneIndex == 0)
+                {
+                    //filter = (float)(weight[FILTER_IDX_NCHW(k, c, s, r)]);
+                    filter = (float)(shFilter[FILTER_IDX_NCHW(0, c, s, r)]);
+                }
+                filter = __shfl_sync(0xFFFFFFFF, filter, 0);
+
+                int y = h + s - S / 2;
+                int x = w + r - R / 2;
+                float ip = 0;
+                if (y >= 0 && y < H && x >= 0 && x < W)
+                    ip = (float)(input[INDEX_NCHW(n, c, y, x)]);
+                op += ip * filter;
+            }   // r
+        }   // s
+    }   // c
+
+    if (bias)
+        op += (float)(bias[k]);
+
+    if (relu && op < 0)
+        op = 0;
+
+    output[INDEX_NCHW(n, k, h, w)] = (T)op;
+}
+#endif
+
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+void convCuda(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    // (N * K * H * W) output elements? (N * 16384)
+    // for each of them need to do (R * S * C) multiple-adds  (2304 - per output element)
+    // need to re-use input and filter elements to avoid making everything memory bound
+
+    // 1. simple strategy
+    // N * K blocks
+    // H * W threads per block
+
+    dim3 gridDim(K, N);
+    dim3 blockDim(W, H);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+
+    for (int i = 0; i < loops * 2; i++)
+    {
+        if (i == loops)
+            cudaEventRecord(start, NULL);
+
+        convKernel<N, K, C, H, W, S, R> << <gridDim, blockDim >> > (output, input, weight, bias, relu);
+    }
+
+    cudaEventRecord(stop, NULL);
+    cudaEventSynchronize(stop);
+
+    float msecTotal = 0.0f;
+    cudaEventElapsedTime(&msecTotal, start, stop);
+    double TFlops = (2.0 * N * W * H * K * C * S * R * loops) / (msecTotal * 1000000000.0);
+    printf("TFlops: %g\n\n", TFlops);
+
+}
 
 int main()
 {
     constexpr bool fp16 = false;
 
-    constexpr int N = 128;
+    constexpr int N = 1;
     constexpr int C = 256;
     constexpr int K = 256;
     constexpr int H = 8;
@@ -221,9 +364,9 @@ int main()
     void *cfilter = malloc(filterBytes);
     void *cbias = malloc(biasBytes);
 
-    fillRandomArray(cinput, inputElements);
-    fillRandomArray(cfilter, filterElements);
-    fillRandomArray(cbias, biasElements);
+    fillRandomArray(cinput, inputElements, fp16);
+    fillRandomArray(cfilter, filterElements, fp16);
+    fillRandomArray(cbias, biasElements, fp16);
 
 
     void *input;
@@ -241,15 +384,46 @@ int main()
     cudaMemcpy(bias, cbias, biasBytes, cudaMemcpyHostToDevice);
 
 
-    // convolution using cudnn
-    cudnnConvTest<N, K, C, H, W, F, F>((float*)output, (float*)input, (float*)filter, (float*) bias, true);
-    cudaMemcpy(coutput, output, outputBytes, cudaMemcpyDeviceToHost);
-
     // convolution using cpu ref
     void *crefop = malloc(outputBytes);
-    convRef<N, K, C, H, W, F, F>((float*)crefop, (float*)cinput, (float*)cfilter, (float*)cbias, true);
+    if (fp16)
+    {
+        convRef<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+    }
+    else
+    {
+        convRef<N, K, C, H, W, F, F>((float*)crefop, (float*)cinput, (float*)cfilter, (float*)cbias, true);
+    }
 
-    compareResults(coutput, crefop, outputElements);
+#if 0
+    // convolution using cudnn
+    if (fp16)
+    {
+        cudnnConvTest<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+    }
+    else
+    {
+        cudnnConvTest<N, K, C, H, W, F, F>((float*)output, (float*)input, (float*)filter, (float*)bias, true);
+    }
+#endif
+
+#if 1
+    // convolution using our own Cuda C kernel
+    if (fp16)
+    {
+        convCuda<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+    }
+    else
+    {
+        convCuda<N, K, C, H, W, F, F>((float*)output, (float*)input, (float*)filter, (float*)bias, true);
+    }
+#endif
+
+
+    cudaMemcpy(coutput, output, outputBytes, cudaMemcpyDeviceToHost);
+
+
+    compareResults(coutput, crefop, outputElements, fp16);
 
     cudaFree(input);
     cudaFree(output);
