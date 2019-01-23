@@ -236,7 +236,7 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 }
 #endif
 
-#if 1
+#if 0
 // simple opt, store filter in shared memory
 template<int N, int K, int C, int H, int W, int S, int R, typename T>
 __global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
@@ -299,6 +299,134 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
     output[INDEX_NCHW(n, k, h, w)] = (T)op;
 }
 #endif
+
+
+#if 1
+// get some spatial reuse for input tensor using shfl
+// assumes S == R == 3!
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+__global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    int n = blockIdx.y;
+    int k = blockIdx.x;
+
+    int h = threadIdx.y;
+    int w = threadIdx.x;
+
+    int threadInBlock = h*W + w;
+    int laneIndex = threadInBlock & 0x1F;
+
+    // the usage pattern here is more like __constant__ memory, 
+    // but we don't have enough to store 256x256x3x3 filter data
+    __shared__ T shFilter[C*R*S];
+
+    for (int i = 0; i < C*R*S / (H*W); i++)
+    {
+        int localIndex = (H*W)*i + threadInBlock;
+        shFilter[localIndex] = weight[k * (C*R*S) + localIndex];
+    }
+
+    __syncthreads();
+
+    float op = 0.0f;
+    #pragma unroll 8
+    for (int c = 0; c < C; c++)
+    {
+        // hardcoded for 3x3 filter
+        float ic = (float)(input[INDEX_NCHW(n, c, h, w)]);
+        float in = 0;
+        float is = 0;
+        float iw = 0;
+        float ie = 0;
+        float inw = 0;
+        float ine = 0;
+        float isw = 0;
+        float ise = 0;
+
+        float sn = __shfl_up_sync(0xFFFFFFFF, ic, 8);
+        float ss = __shfl_down_sync(0xFFFFFFFF, ic, 8);
+
+
+        if (h == 4)
+            in = (float)(input[INDEX_NCHW(n, c, h-1, w)]);
+        else if (h != 0)
+            in = sn;
+
+        if (h == 3)
+            is = (float)(input[INDEX_NCHW(n, c, h + 1, w)]);
+        else if (h != 7)
+            is = ss;
+
+        float sw = __shfl_up_sync(0xFFFFFFFF, ic, 1);
+        float snw = __shfl_up_sync(0xFFFFFFFF, in, 1);
+        float ssw = __shfl_up_sync(0xFFFFFFFF, is, 1);
+        if (w != 0)
+        {
+            iw = sw;
+            inw = snw;
+            isw = ssw;
+        }
+
+        float se = __shfl_down_sync(0xFFFFFFFF, ic, 1);
+        float sne = __shfl_down_sync(0xFFFFFFFF, in, 1);
+        float sse = __shfl_down_sync(0xFFFFFFFF, is, 1);
+
+        if (w != 7)
+        {
+            ie = se;
+            ine = sne;
+            ise = sse;
+        }
+
+        union
+        {
+            struct
+            {
+                float nw;
+                float n;
+                float ne;
+                float w;
+                float c;
+                float e;
+                float sw;
+                float s;
+                float se;
+            };
+            float arr[3][3];
+        } wt;
+
+        #pragma unroll
+        for (int s = 0; s < S; s++)
+        {
+            #pragma unroll
+            for (int r = 0; r < R; r++)
+            {
+                wt.arr[s][r] = (float)(shFilter[FILTER_IDX_NCHW(0, c, s, r)]);
+            }
+        }
+
+
+        op +=   ic   * wt.c +
+                in   * wt.n +
+                is   * wt.s +
+                iw   * wt.w +
+                ie   * wt.e +
+                inw  * wt.nw +
+                ine  * wt.ne +
+                isw  * wt.sw +
+                ise  * wt.se;
+    }   // c
+
+    if (bias)
+        op += (float)(bias[k]);
+
+    if (relu && op < 0)
+        op = 0;
+
+    output[INDEX_NCHW(n, k, h, w)] = (T)op;
+}
+#endif
+
 
 template<int N, int K, int C, int H, int W, int S, int R, typename T>
 void convCuda(T *output, const T *input, const T *weight, const T *bias, bool relu)

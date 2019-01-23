@@ -30,16 +30,17 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
             b = ((float*)arr2)[i];
         }
 
-        if (i < 20)
-        {
-            printf("\n%12.8f, %12.8f", a, b);
-        }
-
         float error = fabs(a - b);
         float bigger = fabs(std::fmax(a, b));
         double percentError = error;
         if (bigger)
             percentError /= bigger;
+
+        if (i < 20)
+        {
+            printf("\n%04d:  %12.8f, %12.8f, .... %g", i, a, b, percentError*100);
+        }
+
         if (percentError > maxError)
         {
             maxError = percentError;
