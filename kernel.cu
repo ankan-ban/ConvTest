@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-constexpr int loops = 1000;
+constexpr int loops = 10000;
 
 
 #define INDEX_NCHW(n,c,h,w) ((n)*C*H*W + (c)*H*W + (h)*W + w)
@@ -301,9 +301,10 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 #endif
 
 
-#if 1
+#if 0
 // get some spatial reuse for input tensor using shfl
 // assumes S == R == 3!
+// and also H == W == 8
 template<int N, int K, int C, int H, int W, int S, int R, typename T>
 __global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
 {
@@ -340,12 +341,18 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
         float ie = 0;
         float inw = 0;
         float ine = 0;
-        float isw = 0;
+        float isw = 0; 
         float ise = 0;
 
+        if (h != 0)
+            in = (float)(input[INDEX_NCHW(n, c, h - 1, w)]);
+
+        if (h != 7)
+            is = (float)(input[INDEX_NCHW(n, c, h + 1, w)]);
+
+#if 0
         float sn = __shfl_up_sync(0xFFFFFFFF, ic, 8);
         float ss = __shfl_down_sync(0xFFFFFFFF, ic, 8);
-
 
         if (h == 4)
             in = (float)(input[INDEX_NCHW(n, c, h-1, w)]);
@@ -356,6 +363,7 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
             is = (float)(input[INDEX_NCHW(n, c, h + 1, w)]);
         else if (h != 7)
             is = ss;
+#endif
 
         float sw = __shfl_up_sync(0xFFFFFFFF, ic, 1);
         float snw = __shfl_up_sync(0xFFFFFFFF, in, 1);
@@ -428,6 +436,153 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 #endif
 
 
+#if 1
+// get some spatial reuse for input tensor using shfl
+// assumes S == R == 3!
+// and also H == W == 8
+
+// also do multiple elements in K dimension per thread
+constexpr int kPerThread = 2;
+
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+__global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    int n = blockIdx.y;
+    int kStart = blockIdx.x * kPerThread;
+
+    int h = threadIdx.y;
+    int w = threadIdx.x;
+
+    int threadInBlock = h*W + w;
+    int laneIndex = threadInBlock & 0x1F;
+
+    // the usage pattern here is more like __constant__ memory, 
+    // but we don't have enough to store 256x256x3x3 filter data
+    __shared__ T shFilter[kPerThread * C*R*S];
+
+    #pragma unroll
+    for (int k = 0; k < kPerThread; k++)
+    {
+        #pragma unroll
+        for (int i = 0; i < C*R*S / (H*W); i++)
+        {
+            int localIndex = (H*W)*i + threadInBlock + k*(C*R*S);
+            shFilter[localIndex] = weight[kStart * (C*R*S) + localIndex];
+        }
+    }
+
+    // accumulators
+    float op[kPerThread];
+    #pragma unroll
+    for (int i = 0; i < kPerThread; i++)
+        op[i] = 0.0f;
+
+    __syncthreads();
+
+
+
+    #pragma unroll 8
+    for (int c = 0; c < C; c++)
+    {
+        // hardcoded for 3x3 filter
+        float ic = (float)(input[INDEX_NCHW(n, c, h, w)]);
+        float in = 0;
+        float is = 0;
+        float iw = 0;
+        float ie = 0;
+        float inw = 0;
+        float ine = 0;
+        float isw = 0; 
+        float ise = 0;
+
+        if (h != 0)
+            in = (float)(input[INDEX_NCHW(n, c, h - 1, w)]);
+
+        if (h != 7)
+            is = (float)(input[INDEX_NCHW(n, c, h + 1, w)]);
+
+        float sw = __shfl_up_sync(0xFFFFFFFF, ic, 1);
+        float snw = __shfl_up_sync(0xFFFFFFFF, in, 1);
+        float ssw = __shfl_up_sync(0xFFFFFFFF, is, 1);
+        if (w != 0)
+        {
+            iw = sw;
+            inw = snw;
+            isw = ssw;
+        }
+
+        float se = __shfl_down_sync(0xFFFFFFFF, ic, 1);
+        float sne = __shfl_down_sync(0xFFFFFFFF, in, 1);
+        float sse = __shfl_down_sync(0xFFFFFFFF, is, 1);
+
+        if (w != 7)
+        {
+            ie = se;
+            ine = sne;
+            ise = sse;
+        }
+
+        union
+        {
+            struct
+            {
+                float nw;
+                float n;
+                float ne;
+                float w;
+                float c;
+                float e;
+                float sw;
+                float s;
+                float se;
+            };
+            float arr[3][3];
+        } wt;
+
+
+        #pragma unroll
+        for (int i = 0; i < kPerThread; i++)
+        {
+            #pragma unroll
+            for (int s = 0; s < S; s++)
+            {
+                #pragma unroll
+                for (int r = 0; r < R; r++)
+                {
+                    wt.arr[s][r] = (float)(shFilter[FILTER_IDX_NCHW(i, c, s, r)]);
+                }
+            }
+
+            op[i] += ic  * wt.c +
+                     in  * wt.n +
+                     is  * wt.s +
+                     iw  * wt.w +
+                     ie  * wt.e +
+                     inw * wt.nw +
+                     ine * wt.ne +
+                     isw * wt.sw +
+                     ise * wt.se;
+        }
+    }   // c
+
+    #pragma unroll
+    for (int i = 0; i < kPerThread; i++)
+    {
+        if (bias)
+            op[i] += (float)(bias[kStart + i]);
+
+        if (relu && op[i] < 0)
+            op[i] = 0;
+
+        output[INDEX_NCHW(n, kStart + i, h, w)] = (T)op[i];
+    }
+
+
+}
+#endif
+
+
+
 template<int N, int K, int C, int H, int W, int S, int R, typename T>
 void convCuda(T *output, const T *input, const T *weight, const T *bias, bool relu)
 {
@@ -439,7 +594,7 @@ void convCuda(T *output, const T *input, const T *weight, const T *bias, bool re
     // N * K blocks
     // H * W threads per block
 
-    dim3 gridDim(K, N);
+    dim3 gridDim(K/kPerThread, N);
     dim3 blockDim(W, H);
 
     cudaEvent_t start, stop;
@@ -514,6 +669,7 @@ int main()
 
     // convolution using cpu ref
     void *crefop = malloc(outputBytes);
+#if 1
     if (fp16)
     {
         convRef<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
@@ -522,12 +678,13 @@ int main()
     {
         convRef<N, K, C, H, W, F, F>((float*)crefop, (float*)cinput, (float*)cfilter, (float*)cbias, true);
     }
+#endif
 
 #if 0
     // convolution using cudnn
     if (fp16)
     {
-        cudnnConvTest<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+        cudnnConvTest<N, K, C, H, W, F, F>((half*)output, (half*)cinput, (half*)cfilter, (half*)cbias, true);
     }
     else
     {
@@ -539,7 +696,7 @@ int main()
     // convolution using our own Cuda C kernel
     if (fp16)
     {
-        convCuda<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+        convCuda<N, K, C, H, W, F, F>((half*)output, (half*)cinput, (half*)cfilter, (half*)cbias, true);
     }
     else
     {
