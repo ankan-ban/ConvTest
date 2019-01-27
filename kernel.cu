@@ -302,6 +302,8 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 
 
 #if 0
+constexpr int kPerThread = 1;
+
 // get some spatial reuse for input tensor using shfl
 // assumes S == R == 3!
 // and also H == W == 8
@@ -344,13 +346,15 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
         float isw = 0; 
         float ise = 0;
 
+#if 0
         if (h != 0)
             in = (float)(input[INDEX_NCHW(n, c, h - 1, w)]);
 
         if (h != 7)
             is = (float)(input[INDEX_NCHW(n, c, h + 1, w)]);
+#endif
 
-#if 0
+#if 1
         float sn = __shfl_up_sync(0xFFFFFFFF, ic, 8);
         float ss = __shfl_down_sync(0xFFFFFFFF, ic, 8);
 
@@ -436,13 +440,18 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 #endif
 
 
-#if 1
+#if 0
 // get some spatial reuse for input tensor using shfl
 // assumes S == R == 3!
 // and also H == W == 8
 
 // also do multiple elements in K dimension per thread
-constexpr int kPerThread = 2;
+constexpr int kPerThread = 1;
+
+constexpr int blockWidth = 8;
+constexpr int blockHeight = 8;
+constexpr int kPerBlock = kPerThread;
+
 
 template<int N, int K, int C, int H, int W, int S, int R, typename T>
 __global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
@@ -495,11 +504,28 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
         float isw = 0; 
         float ise = 0;
 
+#if 0
         if (h != 0)
             in = (float)(input[INDEX_NCHW(n, c, h - 1, w)]);
 
         if (h != 7)
             is = (float)(input[INDEX_NCHW(n, c, h + 1, w)]);
+#endif
+
+#if 1
+        float sn = __shfl_up_sync(0xFFFFFFFF, ic, 8);
+        float ss = __shfl_down_sync(0xFFFFFFFF, ic, 8);
+
+        if (h == 4)
+            in = (float)(input[INDEX_NCHW(n, c, h - 1, w)]);
+        else if (h != 0)
+            in = sn;
+
+        if (h == 3)
+            is = (float)(input[INDEX_NCHW(n, c, h + 1, w)]);
+        else if (h != 7)
+            is = ss;
+#endif
 
         float sw = __shfl_up_sync(0xFFFFFFFF, ic, 1);
         float snw = __shfl_up_sync(0xFFFFFFFF, in, 1);
@@ -582,6 +608,528 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 #endif
 
 
+#if 1
+// get some spatial reuse for input tensor using shfl
+// assumes S == R == 3!
+// and also H == W == 8
+
+// do multiple elements in H and W dimensions (2x2)
+constexpr int wPerThread = 2;
+constexpr int hPerThread = 2;
+
+// 64 threads in block
+constexpr int blockWidth = 8;
+constexpr int blockHeight = 8;
+
+// as every thread processes 2x2 output elements a time, we have 2x2 boards per block
+constexpr int kPerBlock = blockWidth * blockHeight * wPerThread * hPerThread / 64;
+
+// these many filter elements from c dimension are loaded into 
+// shared memory at a time
+constexpr int cPerIter = 64;
+
+#define SHFILTER_IDX_NCHW(k,c,h,w) ((k)*cPerIter*S*R + (c)*S*R + (h)*R + w)
+
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+__global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    int n = blockIdx.y;
+    int kStart = blockIdx.x * kPerBlock;
+
+    int hStart = (threadIdx.y & 0x3) * hPerThread;
+    int wStart = (threadIdx.x & 0x3) * wPerThread;
+    int kLocal = (threadIdx.y >> 2) * 2 + (threadIdx.x >> 2);
+
+    int threadInBlock = threadIdx.y * blockWidth + threadIdx.x;
+
+    // the usage pattern here is more like __constant__ memory, 
+    // but we don't have enough to store 256x256x3x3 filter data
+    __shared__ T shFilter[kPerBlock * cPerIter * R * S];
+
+    // accumulators
+    float op[2][2];
+    op[0][0] = 0.0f;
+    op[0][1] = 0.0f;
+    op[1][0] = 0.0f;
+    op[1][1] = 0.0f;
+
+
+    //#pragma unroll 2
+    // outer loop
+    for (int cbase = 0; cbase < C; cbase+= cPerIter)
+    {
+        // load filters into shared memory
+        #pragma unroll
+        for (int k = 0; k < kPerBlock; k++)
+        {
+            #pragma unroll
+            for (int i = 0; i < 9; i++)     // 64 threads read cPerIter (64) filters of 3x3 size
+            {
+                int index = 64*i + threadInBlock;
+                int localIndex = k*cPerIter * 9 + index;
+                int globalIndex = (kStart + k) * C * 9 + index + cbase * 9;
+                shFilter[localIndex] = weight[globalIndex];
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll 16
+        for (int lc = 0; lc < cPerIter; lc++)
+        {
+            int c = cbase + lc;
+
+            // hardcoded for 3x3 filter, and 2x2 spatial elements per thread
+            float inEl[4][4];
+            #pragma unroll
+            for (int y = 0; y < 4; y++)
+                #pragma unroll
+                for (int x = 0; x < 4; x++)
+                    inEl[y][x] = 0.0f;
+
+            
+            inEl[1][1] = (float)(input[INDEX_NCHW(n, c, hStart, wStart)]);
+            inEl[1][2] = (float)(input[INDEX_NCHW(n, c, hStart, wStart+1)]);
+            inEl[2][1] = (float)(input[INDEX_NCHW(n, c, hStart+1, wStart)]);
+            inEl[2][2] = (float)(input[INDEX_NCHW(n, c, hStart+1, wStart+1)]);
+
+            // need temps because shfl needs all threads in warp to participate
+            float t01 = __shfl_up_sync(0xFFFFFFFF, inEl[2][1], 8);
+            float t02 = __shfl_up_sync(0xFFFFFFFF, inEl[2][2], 8);
+            if (hStart != 0)
+            {
+                inEl[0][1] = t01;
+                inEl[0][2] = t02;
+            }
+
+            float t31 = __shfl_down_sync(0xFFFFFFFF, inEl[1][1], 8);
+            float t32 = __shfl_down_sync(0xFFFFFFFF, inEl[1][2], 8);
+            if (hStart != 6)
+            {
+                inEl[3][1] = t31;
+                inEl[3][2] = t32;
+            }
+
+            float t00 = __shfl_up_sync(0xFFFFFFFF, inEl[0][2], 1);
+            float t10 = __shfl_up_sync(0xFFFFFFFF, inEl[1][2], 1);
+            float t20 = __shfl_up_sync(0xFFFFFFFF, inEl[2][2], 1);
+            float t30 = __shfl_up_sync(0xFFFFFFFF, inEl[3][2], 1);
+            if (wStart != 0)
+            {
+                inEl[0][0] = t00;
+                inEl[1][0] = t10;
+                inEl[2][0] = t20;
+                inEl[3][0] = t30;
+            }
+
+            float t03 = __shfl_down_sync(0xFFFFFFFF, inEl[0][1], 1);
+            float t13 = __shfl_down_sync(0xFFFFFFFF, inEl[1][1], 1);
+            float t23 = __shfl_down_sync(0xFFFFFFFF, inEl[2][1], 1);
+            float t33 = __shfl_down_sync(0xFFFFFFFF, inEl[3][1], 1);
+            if (wStart != 6)
+            {
+                inEl[0][3] = t03;
+                inEl[1][3] = t13;
+                inEl[2][3] = t23;
+                inEl[3][3] = t33;
+            }
+
+
+            #pragma unroll
+            for (int s = 0; s < S; s++)
+            {
+                #pragma unroll
+                for (int r = 0; r < R; r++)
+                {
+                    float weight = (float)(shFilter[SHFILTER_IDX_NCHW(kLocal, lc, s, r)]);
+                    #pragma unroll
+                    for (int y = 0; y < 2; y++)
+                    {
+                        #pragma unroll
+                        for (int x = 0; x < 2; x++)
+                        {
+                            op[y][x] += inEl[y + s][x + r] * weight;
+                        }
+                    }
+                }
+            }
+        } // lc
+
+        __syncthreads();
+    }   // cbase
+
+    int k = kStart + kLocal;
+    float b = bias ? bias[k] : 0;
+
+    #pragma unroll
+    for (int y = 0; y < 2; y++)
+    {
+        #pragma unroll
+        for (int x = 0; x < 2; x++)
+        {
+            op[y][x] += b;
+
+            if (relu && op[y][x] < 0)
+                op[y][x] = 0;
+
+            // TODO: consider 64-bit writes
+            // tried below - doesn't make any difference at all! (or maybe about 2% slower)
+            // output[INDEX_NCHW(n, k, hStart+y, wStart+x)] = (T)op[y][x];
+        }
+    }
+
+    ((uint2 *)output)[INDEX_NCHW(n, k, hStart, wStart) >> 1] = *((uint2 *)&op[0][0]);
+    ((uint2 *)output)[INDEX_NCHW(n, k, hStart+1, wStart) >> 1] = *((uint2 *)&op[1][0]);
+
+}
+#endif
+
+// quite a bit slower!
+// (too many registers per thread?)
+#if 0
+// get some spatial reuse for input tensor using shfl
+// assumes S == R == 3!
+// and also H == W == 8
+
+// do multiple elements in H and W dimensions (4x4)
+constexpr int wPerThread = 4;
+constexpr int hPerThread = 4;
+
+// 32 threads in block
+constexpr int blockWidth  = 4;  // one board (4 threads, with 16 elements per thread)
+constexpr int blockHeight = 8;  // different 'C' dimensions
+
+constexpr int kPerBlock = 1;
+
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+__global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    int n = blockIdx.y;
+    int k = blockIdx.x;
+
+    int hStart = (threadIdx.x >> 1) * hPerThread;
+    int wStart = (threadIdx.x  & 1) * wPerThread;
+    constexpr int cPerThread = C / blockHeight;
+    int cBase  = threadIdx.y * cPerThread;
+
+    int threadInBlock = threadIdx.y * blockWidth + threadIdx.x;
+
+    __shared__ T shFilter[C * R * S];
+
+    // accumulators
+    float op[4][4];
+    #pragma unroll
+    for (int y = 0; y < hPerThread; y++)
+        #pragma unroll
+        for (int x = 0; x < wPerThread; x++)
+            op[y][x] = 0;
+
+
+    // load filters into shared memory
+    #pragma unroll
+    for (int i = 0; i < C*R*S / 32; i++)
+    {
+        int localIndex = (32)*i + threadInBlock;
+        shFilter[localIndex] = weight[k * (C*R*S) + localIndex];
+    }
+
+    #pragma unroll 8
+    for (int lc = 0; lc < cPerThread; lc++)
+    {
+        int c = cBase + lc;
+
+        // hardcoded for 3x3 filter, and 4x4 spatial elements per thread
+        float inEl[hPerThread+2][wPerThread+2];
+        #pragma unroll
+        for (int y = 0; y < hPerThread+2; y++)
+            #pragma unroll
+            for (int x = 0; x < wPerThread+2; x++)
+                inEl[y][x] = 0.0f;
+
+        #pragma unroll
+        for (int y = 0; y < hPerThread; y++)
+            #pragma unroll
+            for (int x = 0; x < wPerThread; x++)
+            {
+                inEl[y+1][x+1] = (float)(input[INDEX_NCHW(n, c, hStart+y, wStart+x)]);
+            }
+
+        // need temps because shfl needs all threads in warp to participate
+        float t01 = __shfl_up_sync(0xFFFFFFFF, inEl[4][1], 2);
+        float t02 = __shfl_up_sync(0xFFFFFFFF, inEl[4][2], 2);
+        float t03 = __shfl_up_sync(0xFFFFFFFF, inEl[4][3], 2);
+        float t04 = __shfl_up_sync(0xFFFFFFFF, inEl[4][4], 2);
+        if (hStart != 0)
+        {
+            inEl[0][1] = t01;
+            inEl[0][2] = t02;
+            inEl[0][3] = t03;
+            inEl[0][4] = t04;
+        }
+
+        float t51 = __shfl_down_sync(0xFFFFFFFF, inEl[1][1], 2);
+        float t52 = __shfl_down_sync(0xFFFFFFFF, inEl[1][2], 2);
+        float t53 = __shfl_down_sync(0xFFFFFFFF, inEl[1][3], 2);
+        float t54 = __shfl_down_sync(0xFFFFFFFF, inEl[1][4], 2);
+        if (hStart == 0)
+        {
+            inEl[5][1] = t51;
+            inEl[5][2] = t52;
+            inEl[5][3] = t53;
+            inEl[5][4] = t54;
+        }
+
+        float t00 = __shfl_up_sync(0xFFFFFFFF, inEl[0][4], 1);
+        float t10 = __shfl_up_sync(0xFFFFFFFF, inEl[1][4], 1);
+        float t20 = __shfl_up_sync(0xFFFFFFFF, inEl[2][4], 1);
+        float t30 = __shfl_up_sync(0xFFFFFFFF, inEl[3][4], 1);
+        float t40 = __shfl_up_sync(0xFFFFFFFF, inEl[4][4], 1);
+        float t50 = __shfl_up_sync(0xFFFFFFFF, inEl[5][4], 1);
+        if (wStart != 0)
+        {
+            inEl[0][0] = t00;
+            inEl[1][0] = t10;
+            inEl[2][0] = t20;
+            inEl[3][0] = t30;
+            inEl[4][0] = t40;
+            inEl[5][0] = t50;
+        }
+
+        float t05 = __shfl_down_sync(0xFFFFFFFF, inEl[0][1], 1);
+        float t15 = __shfl_down_sync(0xFFFFFFFF, inEl[1][1], 1);
+        float t25 = __shfl_down_sync(0xFFFFFFFF, inEl[2][1], 1);
+        float t35 = __shfl_down_sync(0xFFFFFFFF, inEl[3][1], 1);
+        float t45 = __shfl_down_sync(0xFFFFFFFF, inEl[4][1], 1);
+        float t55 = __shfl_down_sync(0xFFFFFFFF, inEl[5][1], 1);
+        if (wStart == 0)
+        {
+            inEl[0][5] = t05;
+            inEl[1][5] = t15;
+            inEl[2][5] = t25;
+            inEl[3][5] = t35;
+            inEl[4][5] = t45;
+            inEl[5][5] = t55;
+        }
+
+
+        #pragma unroll
+        for (int s = 0; s < S; s++)
+        {
+            #pragma unroll
+            for (int r = 0; r < R; r++)
+            {
+                float weight = (float)(shFilter[FILTER_IDX_NCHW(0, c, s, r)]);
+                #pragma unroll
+                for (int y = 0; y < hPerThread; y++)
+                {
+                    #pragma unroll
+                    for (int x = 0; x < wPerThread; x++)
+                    {
+                        op[y][x] += inEl[y + s][x + r] * weight;
+                    }
+                }
+            }
+        }
+    } // lc / c
+
+    float b = bias ? bias[k] : 0;
+
+    #pragma unroll
+    for (int y = 0; y < hPerThread; y++)
+    {
+        #pragma unroll
+        for (int x = 0; x < wPerThread; x++)
+        {
+            // sum across C dimension
+            op[y][x] += __shfl_down_sync(0xFFFFFFFF, op[y][x], 4);
+            op[y][x] += __shfl_down_sync(0xFFFFFFFF, op[y][x], 8);
+            op[y][x] += __shfl_down_sync(0xFFFFFFFF, op[y][x], 16);
+
+            op[y][x] += b;
+
+            if (relu && op[y][x] < 0)
+                op[y][x] = 0;
+
+            // TODO: consider 64-bit writes
+            // tried below - doesn't make any difference at all! (or maybe about 2% slower)
+
+            if (threadIdx.y == 0)
+                output[INDEX_NCHW(n, k, hStart+y, wStart+x)] = (T)op[y][x];
+        }
+    }
+
+    //((uint2 *)output)[INDEX_NCHW(n, k, hStart, wStart) >> 1] = *((uint2 *)&op[0][0]);
+    //((uint2 *)output)[INDEX_NCHW(n, k, hStart+1, wStart) >> 1] = *((uint2 *)&op[1][0]);
+
+}
+#endif
+
+// significantly slower than 2x2 boards per thread block! ??
+#if 0
+// AGAIN, some bug causing minor differences (max difference, 4.57%, avg difference 0.99%)
+//   ... fixed, be careful of shfl offsets
+//  .. 0.74 TFlops
+// get some spatial reuse for input tensor using shfl
+// assumes S == R == 3!
+// and also H == W == 8
+
+// do multiple elements in H and W dimensions (2x2)
+constexpr int wPerThread = 2;
+constexpr int hPerThread = 2;
+
+// 32 threads in block
+constexpr int blockWidth  = 16;  // one board (16 threads, with 4 elements per thread)
+constexpr int blockHeight =  2;  // different 'C' dimensions
+
+constexpr int kPerBlock = 1;
+
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+__global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    int n = blockIdx.y;
+    int k = blockIdx.x;
+
+    int hStart = (threadIdx.x >> 2) * hPerThread;
+    int wStart = (threadIdx.x  & 3) * wPerThread;
+    constexpr int cPerThread = C / blockHeight;
+    int cBase  = threadIdx.y * cPerThread;
+
+    int threadInBlock = threadIdx.y * blockWidth + threadIdx.x;
+
+    __shared__ T shFilter[C * R * S];
+
+    // accumulators
+    float op[2][2];
+    #pragma unroll
+    for (int y = 0; y < hPerThread; y++)
+        #pragma unroll
+        for (int x = 0; x < wPerThread; x++)
+            op[y][x] = 0;
+
+
+    // load filters into shared memory
+    #pragma unroll
+    for (int i = 0; i < C*R*S / 32; i++)
+    {
+        int localIndex = (32)*i + threadInBlock;
+        shFilter[localIndex] = weight[k * (C*R*S) + localIndex];
+    }
+
+    #pragma unroll 8
+    for (int lc = 0; lc < cPerThread; lc++)
+    {
+        int c = cBase + lc;
+
+        // hardcoded for 3x3 filter, and 2x2 spatial elements per thread
+        float inEl[hPerThread+2][wPerThread+2];
+        #pragma unroll
+        for (int y = 0; y < hPerThread+2; y++)
+            #pragma unroll
+            for (int x = 0; x < wPerThread+2; x++)
+                inEl[y][x] = 0;
+
+        #pragma unroll
+        for (int y = 0; y < hPerThread; y++)
+            #pragma unroll
+            for (int x = 0; x < wPerThread; x++)
+            {
+                inEl[y+1][x+1] = (float)(input[INDEX_NCHW(n, c, hStart+y, wStart+x)]);
+            }
+
+        // need temps because shfl needs all threads in warp to participate
+        float t01 = __shfl_up_sync(0xFFFFFFFF, inEl[2][1], 4);
+        float t02 = __shfl_up_sync(0xFFFFFFFF, inEl[2][2], 4);
+        if (hStart != 0)
+        {
+            inEl[0][1] = t01;
+            inEl[0][2] = t02;
+        }
+
+        float t31 = __shfl_down_sync(0xFFFFFFFF, inEl[1][1], 4);
+        float t32 = __shfl_down_sync(0xFFFFFFFF, inEl[1][2], 4);
+        if (hStart != 6)
+        {
+            inEl[3][1] = t31;
+            inEl[3][2] = t32;
+        }
+
+        float t00 = __shfl_up_sync(0xFFFFFFFF, inEl[0][2], 1);
+        float t10 = __shfl_up_sync(0xFFFFFFFF, inEl[1][2], 1);
+        float t20 = __shfl_up_sync(0xFFFFFFFF, inEl[2][2], 1);
+        float t30 = __shfl_up_sync(0xFFFFFFFF, inEl[3][2], 1);
+        if (wStart != 0)
+        {
+            inEl[0][0] = t00;
+            inEl[1][0] = t10;
+            inEl[2][0] = t20;
+            inEl[3][0] = t30;
+        }
+
+        float t03 = __shfl_down_sync(0xFFFFFFFF, inEl[0][1], 1);
+        float t13 = __shfl_down_sync(0xFFFFFFFF, inEl[1][1], 1);
+        float t23 = __shfl_down_sync(0xFFFFFFFF, inEl[2][1], 1);
+        float t33 = __shfl_down_sync(0xFFFFFFFF, inEl[3][1], 1);
+        if (wStart != 6)
+        {
+            inEl[0][3] = t03;
+            inEl[1][3] = t13;
+            inEl[2][3] = t23;
+            inEl[3][3] = t33;
+        }
+
+        #pragma unroll
+        for (int s = 0; s < S; s++)
+        {
+            #pragma unroll
+            for (int r = 0; r < R; r++)
+            {
+                float weight = (float)(shFilter[FILTER_IDX_NCHW(0, c, s, r)]);
+                #pragma unroll
+                for (int y = 0; y < hPerThread; y++)
+                {
+                    #pragma unroll
+                    for (int x = 0; x < wPerThread; x++)
+                    {
+                        op[y][x] += inEl[y + s][x + r] * weight;
+                    }
+                }
+            }
+        }
+    } // lc / c
+
+    float b = bias ? bias[k] : 0;
+
+    #pragma unroll
+    for (int y = 0; y < hPerThread; y++)
+    {
+        #pragma unroll
+        for (int x = 0; x < wPerThread; x++)
+        {
+            // sum across C dimension
+            op[y][x] += __shfl_down_sync(0xFFFFFFFF, op[y][x], 16);
+
+            op[y][x] += b;
+
+            if (relu && op[y][x] < 0)
+                op[y][x] = 0;
+
+            // TODO: consider 64-bit writes
+            // tried below - doesn't make any difference at all! (or maybe about 2% slower)
+
+            if (threadIdx.y == 0)
+                output[INDEX_NCHW(n, k, hStart+y, wStart+x)] = (T)op[y][x];
+        }
+    }
+
+    /*
+    if (threadIdx.y == 0)
+    {
+        ((uint2 *)output)[INDEX_NCHW(n, k, hStart, wStart) >> 1] = *((uint2 *)&op[0][0]);
+        ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 1, wStart) >> 1] = *((uint2 *)&op[1][0]);
+    }
+    */
+}
+#endif
+
 
 template<int N, int K, int C, int H, int W, int S, int R, typename T>
 void convCuda(T *output, const T *input, const T *weight, const T *bias, bool relu)
@@ -594,8 +1142,8 @@ void convCuda(T *output, const T *input, const T *weight, const T *bias, bool re
     // N * K blocks
     // H * W threads per block
 
-    dim3 gridDim(K/kPerThread, N);
-    dim3 blockDim(W, H);
+    dim3 gridDim(K/kPerBlock, N);
+    dim3 blockDim(blockWidth, blockHeight);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -696,7 +1244,7 @@ int main()
     // convolution using our own Cuda C kernel
     if (fp16)
     {
-        convCuda<N, K, C, H, W, F, F>((half*)output, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+        convCuda<N, K, C, H, W, F, F>((half*)output, (half*)input, (half*)filter, (half*)bias, true);
     }
     else
     {

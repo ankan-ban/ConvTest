@@ -15,6 +15,7 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
     double maxError = 0;
     double totalError = 0;
     float max_err_a = 0, max_err_b = 0;
+    int max_err_index = 0;
     printf("\nFirst few elements: ");
     for (int i = 0; i < size; i++)
     {
@@ -38,7 +39,7 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
 
         if (i < 20)
         {
-            printf("\n%04d:  %12.8f, %12.8f, .... %g", i, a, b, percentError*100);
+            printf("\n%04d:  %12.8f, %12.8f, .... %11.8f", i, a, b, percentError*100);
         }
 
         if (percentError > maxError)
@@ -46,6 +47,7 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
             maxError = percentError;
             max_err_a = a;
             max_err_b = b;
+            max_err_index = i;
         }
         totalError += percentError;
     }
@@ -54,8 +56,8 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
     avgError *= 100;
     maxError *= 100;
 
-    printf("\nMax error: %f, avg error: %f, max error pair:\n", maxError, avgError);
-    printf("%12.8f, %12.8f\n", max_err_a, max_err_b);
+    printf("\nMax error: %f, avg error: %f, max error pair:", maxError, avgError);
+    printf("\n%04d:  %12.8f, %12.8f\n", max_err_index, max_err_a, max_err_b);
 }
 
 void fillRandomArray(void *out, int size, bool testFp16)
