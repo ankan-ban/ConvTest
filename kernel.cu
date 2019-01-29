@@ -789,6 +789,8 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 
 // quite a bit slower!
 // (too many registers per thread?)
+//  --- NO! misaligned/uncoleased reads were the problem
+// TFlops: 0.984174 without C dimension split, great hopes with split!
 #if 0
 // get some spatial reuse for input tensor using shfl
 // assumes S == R == 3!
@@ -849,6 +851,7 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
             for (int x = 0; x < wPerThread+2; x++)
                 inEl[y][x] = 0.0f;
 
+        /*
         #pragma unroll
         for (int y = 0; y < hPerThread; y++)
             #pragma unroll
@@ -856,6 +859,15 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
             {
                 inEl[y+1][x+1] = (float)(input[INDEX_NCHW(n, c, hStart+y, wStart+x)]);
             }
+            */
+
+        // assume wPerThread == 4, and use a 128 bit reads
+        *((uint4*)(&inEl[1][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart, wStart)]));
+        *((uint4*)(&inEl[2][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart+1, wStart)]));
+        *((uint4*)(&inEl[3][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart+2, wStart)]));
+        *((uint4*)(&inEl[4][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart+3, wStart)]));
+
+
 
         // need temps because shfl needs all threads in warp to participate
         float t01 = __shfl_up_sync(0xFFFFFFFF, inEl[4][1], 2);
@@ -953,16 +965,21 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
             if (relu && op[y][x] < 0)
                 op[y][x] = 0;
 
-            // TODO: consider 64-bit writes
-            // tried below - doesn't make any difference at all! (or maybe about 2% slower)
+            // TODO: consider 128-bit writes
+            // tried below - little bit (2%) faster!
 
-            if (threadIdx.y == 0)
-                output[INDEX_NCHW(n, k, hStart+y, wStart+x)] = (T)op[y][x];
+            //if (threadIdx.y == 0)
+            //    output[INDEX_NCHW(n, k, hStart+y, wStart+x)] = (T)op[y][x];
         }
     }
 
-    //((uint2 *)output)[INDEX_NCHW(n, k, hStart, wStart) >> 1] = *((uint2 *)&op[0][0]);
-    //((uint2 *)output)[INDEX_NCHW(n, k, hStart+1, wStart) >> 1] = *((uint2 *)&op[1][0]);
+    if (threadIdx.y == 0)
+    {
+        ((uint4 *)output)[INDEX_NCHW(n, k, hStart, wStart) >> 2] = *((uint4 *)&op[0][0]);
+        ((uint4 *)output)[INDEX_NCHW(n, k, hStart+1, wStart) >> 2] = *((uint4 *)&op[1][0]);
+        ((uint4 *)output)[INDEX_NCHW(n, k, hStart+2, wStart) >> 2] = *((uint4 *)&op[2][0]);
+        ((uint4 *)output)[INDEX_NCHW(n, k, hStart+3, wStart) >> 2] = *((uint4 *)&op[3][0]);
+    }
 
 }
 #endif
@@ -1136,7 +1153,7 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 #endif
 
 
-#if 1
+#if 0
 // Assumes  
 // - S == R == 3
 // - H == W == 8
@@ -1144,7 +1161,7 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 // Optimizations:
 // - some spatial reuse for input tensor using shfl
 // - do multiple elements in H and W dimensions (2x2) per thread, to get more spatial reuse for input tensor as well as filter
-// - C dimension is sliced into multiple chunks (of 64) to reduce shared memory usage to get better occupancy (allow more blocks per SM)
+// - C dimension is sliced into multiple chunks (of 32) to reduce shared memory usage to get better occupancy (allow more blocks per SM)
 
 constexpr int wPerThread = 2;
 constexpr int hPerThread = 2;
@@ -1223,10 +1240,28 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
                 }
 #endif
 
+
             // assume wPerThread == 2, and use a single 64 bit read
             *((uint2*)(&inEl[1][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart, wStart)]));
             *((uint2*)(&inEl[2][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart+1, wStart)]));
 
+            // buggy! and slow as needs local memory spill (due to indexed register usage for shfl)
+#if 0
+            // read entire board in a single request, and then use shfl to get elements in right place
+            union {
+                float4 vec;
+                float arr[4];
+            } temp;
+
+            temp.vec = *((float4*)(&input[INDEX_NCHW(n, c, 0, threadIdx.x*4)]));
+
+            int i0 = (hStart * 8 + wStart) & 3;
+            int i1 = (hStart * 8 + wStart) >> 2;
+            inEl[1][1] = __shfl_sync(0xFFFFFFFF, temp.arr[i0], i1);
+            inEl[1][2] = __shfl_sync(0xFFFFFFFF, temp.arr[i0+1], i1);
+            inEl[2][1] = __shfl_sync(0xFFFFFFFF, temp.arr[i0], i1+2);
+            inEl[2][2] = __shfl_sync(0xFFFFFFFF, temp.arr[i0+1], i1+2);
+#endif
 
             // need temps because shfl needs all threads in warp to participate
             float t01 = __shfl_up_sync(0xFFFFFFFF, inEl[2][1], 4);
@@ -1321,6 +1356,205 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
         ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 1, wStart) >> 1] = *((uint2 *)&op[1][0]);
     }
     */
+    
+}
+#endif
+
+
+
+#if 1
+// Assumes  
+// - S == R == 3
+// - H == W == 8
+// 
+// Optimizations:
+// - some spatial reuse for input tensor using shfl
+// - do multiple elements in H and W dimensions (4x4) per thread, to get more spatial reuse for input tensor as well as filter
+// - C dimension is sliced into multiple chunks (of 64) to reduce shared memory usage to get better occupancy (allow more blocks per SM)
+
+constexpr int wPerThread = 4;
+constexpr int hPerThread = 4;
+
+// 32 threads in block
+constexpr int blockWidth  = 4;  // one board (4 threads, with 16 elements per thread)
+constexpr int blockHeight = 8;  // different 'C' dimensions
+
+// these many filter elements from c dimension are loaded into 
+// shared memory at a time (should be a multiple of warp size)
+constexpr int cPerIter = 32;    
+constexpr int cPerIterPerThread = cPerIter / blockHeight;
+
+constexpr int kPerBlock = 1;
+
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+__global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    int n = blockIdx.y;
+    int k = blockIdx.x;
+
+    int hStart = (threadIdx.x >> 1) * hPerThread;
+    int wStart = (threadIdx.x  & 1) * wPerThread;
+
+    // offset to be added to get C index
+    int cOffset  = threadIdx.y * cPerIterPerThread;
+
+    int threadInBlock = threadIdx.y * blockWidth + threadIdx.x;
+
+    __shared__ T shFilter[cPerIter * R * S];
+
+    // accumulators
+    float op[4][4];
+    #pragma unroll
+    for (int y = 0; y < hPerThread; y++)
+        #pragma unroll
+        for (int x = 0; x < wPerThread; x++)
+            op[y][x] = 0;
+
+    // outer loop
+    // #pragma unroll 4
+    for (int cBase = 0; cBase < C; cBase += cPerIter)
+    {
+        // load filters into shared memory
+        #pragma unroll
+        for (int i = 0; i < cPerIter*R*S / 32; i++)
+        {
+            int localIndex = 32 * i + threadInBlock;
+            shFilter[localIndex] = weight[k * (C*R*S) + cBase * (R*S) + localIndex];
+        }
+
+
+        #pragma unroll
+        for (int lc = 0; lc < cPerIterPerThread; lc++)
+        {
+            int shc = cOffset + lc;     // offset of filter for index c in shared memory
+            int c = cBase + shc;        // real c dimension
+
+            // hardcoded for 3x3 filter, and 4x4 spatial elements per thread
+            float inEl[hPerThread+2][wPerThread+2];
+            #pragma unroll
+            for (int y = 0; y < hPerThread+2; y++)
+                #pragma unroll
+                for (int x = 0; x < wPerThread+2; x++)
+                    inEl[y][x] = 0.0f;
+
+
+            // assume wPerThread == 4, and use a 128 bit reads
+            *((uint4*)(&inEl[1][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart, wStart)]));
+            *((uint4*)(&inEl[2][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart + 1, wStart)]));
+            *((uint4*)(&inEl[3][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart + 2, wStart)]));
+            *((uint4*)(&inEl[4][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart + 3, wStart)]));
+
+            // need temps because shfl needs all threads in warp to participate
+            float t01 = __shfl_up_sync(0xFFFFFFFF, inEl[4][1], 2);
+            float t02 = __shfl_up_sync(0xFFFFFFFF, inEl[4][2], 2);
+            float t03 = __shfl_up_sync(0xFFFFFFFF, inEl[4][3], 2);
+            float t04 = __shfl_up_sync(0xFFFFFFFF, inEl[4][4], 2);
+            if (hStart != 0)
+            {
+                inEl[0][1] = t01;
+                inEl[0][2] = t02;
+                inEl[0][3] = t03;
+                inEl[0][4] = t04;
+            }
+
+            float t51 = __shfl_down_sync(0xFFFFFFFF, inEl[1][1], 2);
+            float t52 = __shfl_down_sync(0xFFFFFFFF, inEl[1][2], 2);
+            float t53 = __shfl_down_sync(0xFFFFFFFF, inEl[1][3], 2);
+            float t54 = __shfl_down_sync(0xFFFFFFFF, inEl[1][4], 2);
+            if (hStart == 0)
+            {
+                inEl[5][1] = t51;
+                inEl[5][2] = t52;
+                inEl[5][3] = t53;
+                inEl[5][4] = t54;
+            }
+
+            float t00 = __shfl_up_sync(0xFFFFFFFF, inEl[0][4], 1);
+            float t10 = __shfl_up_sync(0xFFFFFFFF, inEl[1][4], 1);
+            float t20 = __shfl_up_sync(0xFFFFFFFF, inEl[2][4], 1);
+            float t30 = __shfl_up_sync(0xFFFFFFFF, inEl[3][4], 1);
+            float t40 = __shfl_up_sync(0xFFFFFFFF, inEl[4][4], 1);
+            float t50 = __shfl_up_sync(0xFFFFFFFF, inEl[5][4], 1);
+            if (wStart != 0)
+            {
+                inEl[0][0] = t00;
+                inEl[1][0] = t10;
+                inEl[2][0] = t20;
+                inEl[3][0] = t30;
+                inEl[4][0] = t40;
+                inEl[5][0] = t50;
+            }
+
+            float t05 = __shfl_down_sync(0xFFFFFFFF, inEl[0][1], 1);
+            float t15 = __shfl_down_sync(0xFFFFFFFF, inEl[1][1], 1);
+            float t25 = __shfl_down_sync(0xFFFFFFFF, inEl[2][1], 1);
+            float t35 = __shfl_down_sync(0xFFFFFFFF, inEl[3][1], 1);
+            float t45 = __shfl_down_sync(0xFFFFFFFF, inEl[4][1], 1);
+            float t55 = __shfl_down_sync(0xFFFFFFFF, inEl[5][1], 1);
+            if (wStart == 0)
+            {
+                inEl[0][5] = t05;
+                inEl[1][5] = t15;
+                inEl[2][5] = t25;
+                inEl[3][5] = t35;
+                inEl[4][5] = t45;
+                inEl[5][5] = t55;
+            }
+
+            #pragma unroll
+            for (int s = 0; s < S; s++)
+            {
+                #pragma unroll
+                for (int r = 0; r < R; r++)
+                {
+                    float weight = (float)(shFilter[FILTER_IDX_NCHW(0, shc, s, r)]);
+                    #pragma unroll
+                    for (int y = 0; y < hPerThread; y++)
+                    {
+                        #pragma unroll
+                        for (int x = 0; x < wPerThread; x++)
+                        {
+                            op[y][x] += inEl[y + s][x + r] * weight;
+                        }
+                    }
+                }
+            }
+        } // lc / c
+    }   // cBase
+
+    float b = bias ? bias[k] : 0;
+
+    #pragma unroll
+    for (int y = 0; y < hPerThread; y++)
+    {
+        #pragma unroll
+        for (int x = 0; x < wPerThread; x++)
+        {
+            // sum across C dimension
+            op[y][x] += __shfl_down_sync(0xFFFFFFFF, op[y][x], 4);
+            op[y][x] += __shfl_down_sync(0xFFFFFFFF, op[y][x], 8);
+            op[y][x] += __shfl_down_sync(0xFFFFFFFF, op[y][x], 16);
+
+            op[y][x] += b;
+
+            if (relu && op[y][x] < 0)
+                op[y][x] = 0;
+
+            // TODO: consider 128-bit writes
+            // tried below - little bit (2%) faster!
+
+            //if (threadIdx.y == 0)
+            //    output[INDEX_NCHW(n, k, hStart+y, wStart+x)] = (T)op[y][x];
+        }
+    }
+
+    if (threadIdx.y == 0)
+    {
+        ((uint4 *)output)[INDEX_NCHW(n, k, hStart, wStart) >> 2] = *((uint4 *)&op[0][0]);
+        ((uint4 *)output)[INDEX_NCHW(n, k, hStart + 1, wStart) >> 2] = *((uint4 *)&op[1][0]);
+        ((uint4 *)output)[INDEX_NCHW(n, k, hStart + 2, wStart) >> 2] = *((uint4 *)&op[2][0]);
+        ((uint4 *)output)[INDEX_NCHW(n, k, hStart + 3, wStart) >> 2] = *((uint4 *)&op[3][0]);
+    }
     
 }
 #endif
