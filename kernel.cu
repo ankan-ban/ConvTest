@@ -332,11 +332,32 @@ void outputTransform4x4(T *output, T *transformedOutput)
 }
 
 template<typename T>
-void processWinogradTile4x4NoOutTransform(T *transformedOutput, T *input, T *filter)
+void filterTransform4x4(T *transformedFilter, T *filter)
 {
-    T transformedInput[6 * 6];
-    T transformedFilter[6 * 6];
+    // transform applied to filter (of size 3x3)
+    T G[6 * 3] = {
+        1.0/4 ,      0 ,      0 ,
+       -1.0/6 , -1.0/6 , -1.0/6 ,
+       -1.0/6 ,  1.0/6 , -1.0/6 ,
+        1.0/24,  1.0/12,  1.0/6 ,
+        1.0/24, -1.0/12,  1.0/6 ,
+        0     ,      0 ,      1
+    };
 
+    T Gt[3 * 6] = {
+        1.0/4,    -1.0/6,     -1.0/6,     1.0/24,     1.0/24,   0,
+        0,        -1.0/6,      1.0/6,     1.0/12,    -1.0/12,   0,
+        0,        -1.0/6,     -1.0/6,     1.0/6,      1.0/6,    1
+    };
+
+    T tempFilter[6 * 3];
+    matrixMulCPU<6, 3, 3, T>(tempFilter, G, filter);
+    matrixMulCPU<6, 6, 3, T>(transformedFilter, tempFilter, Gt);
+}
+
+template<typename T>
+void inputTransform4x4(T *transformedInput, T *input)
+{
     // transform applied to input tile (of size 4x4)
     T Bt[6 * 6] = {
         4,  0, -5,  0, 1, 0,
@@ -357,31 +378,23 @@ void processWinogradTile4x4NoOutTransform(T *transformedOutput, T *input, T *fil
         0,  0,  0,  0,  0,  1
     };
 
-    // transform applied to filter (of size 3x3)
-    T G[6 * 3] = {
-        1.0/4 ,      0 ,      0 ,
-       -1.0/6 , -1.0/6 , -1.0/6 ,
-       -1.0/6 ,  1.0/6 , -1.0/6 ,
-        1.0/24,  1.0/12,  1.0/6 ,
-        1.0/24, -1.0/12,  1.0/6 ,
-        0     ,      0 ,      1
-    };
-
-    T Gt[3 * 6] = {
-        1.0/4,    -1.0/6,     -1.0/6,     1.0/24,     1.0/24,   0,
-        0,        -1.0/6,      1.0/6,     1.0/12,    -1.0/12,   0,
-        0,        -1.0/6,     -1.0/6,     1.0/6,      1.0/6,    1
-    };
-
-    // 1. transform the input
     T tempIp1[6 * 6];
     matrixMulCPU<6, 6, 6, T>(tempIp1, Bt, input);
     matrixMulCPU<6, 6, 6, T>(transformedInput, tempIp1, B);
+}
+
+template<typename T>
+void processWinogradTile4x4NoOutTransform(T *transformedOutput, T *input, T *filter)
+{
+    T transformedInput[6 * 6];
+    T transformedFilter[6 * 6];
+
+
+    // 1. transform the input
+    inputTransform4x4(transformedInput, input);
 
     // 2. transform the filter
-    T tempFilter[6 * 3];
-    matrixMulCPU<6, 3, 3, T>(tempFilter, G, filter);
-    matrixMulCPU<6, 6, 3, T>(transformedFilter, tempFilter, Gt);
+    filterTransform4x4(transformedFilter, filter);
 
 
     // 3. element wise product of transformed filter and transformed input
@@ -410,7 +423,7 @@ void convRef_Winograd4x4(T *output, const T *input, const T *weight, const T *bi
         {
             for (int h = 0; h < H; h += 4)
             {
-                for (int w = 0; w < W; w += 4)    // process 2x2 output tile a time
+                for (int w = 0; w < W; w += 4)    // process 4x4 output tile a time
                 {
                     T op[4][4];
                     T transformedOutputAccum[6][6];
@@ -424,7 +437,7 @@ void convRef_Winograd4x4(T *output, const T *input, const T *weight, const T *bi
 
                         T transformedOpTile[6][6];
 
-                        T inputTile[6][6];          // window of input tile needed to compute the 2x2 output tile
+                        T inputTile[6][6];          // window of input tile needed to compute the 4x4 output tile
 
                         for (int i = 0; i < 6; i++)
                             for (int j = 0; j < 6; j++)
@@ -466,8 +479,8 @@ void convRef_Winograd4x4(T *output, const T *input, const T *weight, const T *bi
                             if (bias)
                                 op[i][j] += (float)(bias[k]);
 
-                            //if (relu && op[i][j] < 0)
-                            //    op[i][j] = 0;
+                            if (relu && op[i][j] < 0)
+                                op[i][j] = 0;
 
                             output[INDEX_NCHW(n, k, h + i, w + j)] = op[i][j];
                         }
@@ -475,6 +488,150 @@ void convRef_Winograd4x4(T *output, const T *input, const T *weight, const T *bi
             } // h
         } // k
     } // n
+}
+
+// same as above but try:
+// 1. transform the entire filter tensor at one go (into HWCK layout)
+//      -- e.g: 6x6x256x256
+// 2. transform the entire input tensor at one go (into HWNC layout)
+//      -- e.g: 12x12x100x256
+// 3. perform batched matrix multiplications (12x12 of them) to get entire output tensor in transformed space
+//      -- again in HWNK layout, e.g: 12x12x100x256
+// 4. transform the entire output tensor in one go (into required output layout - i.e, NCHW)
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+void convTest_Winograd4x4Matmul(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    T *transformedFilter = new T[6 * 6 * C * K];
+
+    // 2x2 = 4 tiles of size 4x4 per board (8x8 = 64 elements), transformed tiles are 6x6
+    T *transformedInput = new T[12 * 12 * N * C];
+    T *transformedOutput = new T[12 * 12 * N * K];	
+
+    // 1. transform the filter(s)
+    for (int k = 0; k < K; k++)
+    {
+        for (int c = 0; c < C; c++)
+        {
+            // 1. read single filter from memory
+            T filterTile[3][3];
+            for (int s = 0; s < S; s++)
+                for (int r = 0; r < R; r++)
+                {
+                    filterTile[s][r] = weight[FILTER_IDX_NCHW(k, c, s, r)];
+                }
+
+            // 2. transform it
+            T transformedFilterTile[6][6];
+            filterTransform4x4(&(transformedFilterTile[0][0]), &(filterTile[0][0]));
+
+            // 3. write it back to memory (in HWCK layout)
+            for (int i = 0; i < 6; i++)
+                for (int j = 0; j < 6; j++)
+                {
+                    transformedFilter[i*6*C*K + j*C*K + c*K + k] = transformedFilterTile[i][j];
+                }
+
+        }
+    }
+
+    // 2. transform the input
+    for (int n = 0; n < N; n++)
+    {
+        for (int h = 0; h < H; h += 4)
+        {
+            for (int w = 0; w < W; w += 4)    // process 2x2 output tile a time
+            {
+                for (int c = 0; c < C; c++)
+                {
+                    T inputTile[6][6];          // window of input tile needed to compute the 4x4 output tile
+                    // 1. read input tile from memory
+                    for (int i = 0; i < 6; i++)
+                        for (int j = 0; j < 6; j++)
+                        {
+                            int y = h + i - 1;
+                            int x = w + j - 1;
+
+                            if (y >= 0 && y < H && x >= 0 && x < W)
+                                inputTile[i][j] = input[INDEX_NCHW(n, c, y, x)];
+                            else
+                                inputTile[i][j] = 0;
+                        }
+
+                    // 2. transform it
+                    T transformedIpTile[6][6];
+                    inputTransform4x4(&(transformedIpTile[0][0]), &(inputTile[0][0]));
+
+                    // 3. write it back to memory (in HWNC layout)
+                    for (int i = 0; i < 6; i++)
+                        for (int j = 0; j < 6; j++)
+                        {
+                            int y = i + 6 * (h / 4);
+                            int x = j + 6 * (w / 4);
+                            transformedInput[y * 12 * N*C + x*N*C + n*C + c] = transformedIpTile[i][j];
+                        }
+                }   // c
+            }   // w
+        } // h
+    } // n
+
+
+    // 3. Batch of matrix multiplies to get transformed output (in HWNK layout).
+    for (int h=0;h<12;h++)
+        for (int w = 0; w < 12; w++)
+        {
+            int fh = h % 6;
+            int fw = w % 6;
+            matrixMulCPU<N, K, C, T>(&(transformedOutput[h*12*N*K + w*N*K]), 
+                                     &(transformedInput[h*12*N*C + w*N*C]), 
+                                     &(transformedFilter[fh*6*C*K + fw*C*K]));
+        }
+
+    // 4. transform the result back 
+    for (int n = 0; n < N; n++)
+    {
+        for (int h = 0; h < H; h += 4)
+        {
+            for (int w = 0; w < W; w += 4)
+            {
+                for (int k = 0; k < K; k++)
+                {
+                    // 1. read from memory
+                    T transformedOpTile[6][6];
+                    for (int i = 0; i < 6; i++)
+                        for (int j = 0; j < 6; j++)
+                        {
+                            int y = i + 6 * (h / 4);
+                            int x = j + 6 * (w / 4);
+                            transformedOpTile[i][j] = transformedOutput[y *12*N*K + x*N*K + n*K + k];
+                        }
+
+                    // 2. transform it
+                    T opTile[4][4];
+                    outputTransform4x4(&(opTile[0][0]), &(transformedOpTile[0][0]));
+
+                    // 3. write it back to memory (in standard NHWC layout)
+                    for (int i = 0; i < 4; i++)
+                        for (int j = 0; j < 4; j++)
+                        {
+                            // apply bias and relu just before writing!
+                            if (bias)
+                                opTile[i][j] += (float)(bias[k]);
+
+                            if (relu && opTile[i][j] < 0)
+                                opTile[i][j] = 0;
+
+                            output[INDEX_NCHW(n, k, h + i, w + j)] = opTile[i][j];
+                        }
+                }   // k
+            }   // w
+        } // h
+    } // n
+
+
+
+    delete[]transformedFilter;
+    delete[]transformedInput;
+    delete[]transformedOutput;
 }
 
 
@@ -2512,6 +2669,8 @@ void convCuda(T *output, const T *input, const T *weight, const T *bias, bool re
 
 int main()
 {
+    // cudaSetDevice(1);
+
     float ip[2 * 2] =  {
         5, 7,
         11, 2
@@ -2588,7 +2747,8 @@ int main()
     else
     {
         //convRef<N, K, C, H, W, F, F>((float*)crefop, (float*)cinput, (float*)cfilter, (float*)cbias, true);
-        convRef_Winograd4x4<N, K, C, H, W, F, F>((float*)crefop, (float*)cinput, (float*)cfilter, (float*)cbias, true);
+        //convRef_Winograd4x4<N, K, C, H, W, F, F>((float*)crefop, (float*)cinput, (float*)cfilter, (float*)cbias, true);
+        convTest_Winograd4x4Matmul<N, K, C, H, W, F, F>((float*)crefop, (float*)cinput, (float*)cfilter, (float*)cbias, true);
     }
 #endif
 
