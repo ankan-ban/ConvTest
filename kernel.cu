@@ -3,11 +3,12 @@
 #include <device_launch_parameters.h>
 #include <cuda_fp16.h>
 #include <cudnn.h>
+#include <chrono>
 
 #include <cstdio>
 #include <cstdlib>
 
-constexpr int loops = 10000;
+constexpr int loops = 100;
 
 
 #define INDEX_NCHW(n,c,h,w) ((n)*C*H*W + (c)*H*W + (h)*W + w)
@@ -25,6 +26,8 @@ constexpr int loops = 10000;
 template<int N, int K, int C, int H, int W, int S, int R, typename T>
 void convRef(T *output, const T *input, const T *weight, const T *bias, bool relu)
 {
+    auto start = std::chrono::system_clock::now();
+
     for (int n = 0; n < N; n++)
     {
         for (int k = 0; k < K; k++)
@@ -62,6 +65,67 @@ void convRef(T *output, const T *input, const T *weight, const T *bias, bool rel
             } // h
         } // k
     } // n
+
+    auto end = std::chrono::system_clock::now();
+    double ops = (2.0 * N * W * H * K * C * S * R);
+    std::chrono::duration<double> elapsed_seconds = end - start;
+    double  time = (elapsed_seconds * 1000.0).count();
+    double gflops = ops / (1000000 * time);
+    printf("\nDone, CPU time: %g ms, gflops: %g\n", time, gflops);
+}
+
+#define INDEX_NHWC(n,c,h,w) ((n)*C*H*W + (h)*W*C + (w)*C + c)
+#define FILTER_IDX_NHWC(k,c,h,w) ((k)*C*S*R + (h)*R*C + (w)*C + c)
+
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+void convRef_NHWC(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    auto start = std::chrono::system_clock::now();
+
+    for (int n = 0; n < N; n++)
+    {
+        for (int k = 0; k < K; k++)
+        {
+            for (int h = 0; h < H; h++)
+            {
+                for (int w = 0; w < W; w++)
+                {
+                    float op = 0.0f;
+                    for (int c = 0; c < C; c++)
+                    {
+                        for (int s = 0; s < S; s++)
+                        {
+                            for (int r = 0; r < R; r++)
+                            {
+                                float filter = (float)(weight[FILTER_IDX_NHWC(k, c, s, r)]);
+                                int y = h + s - S / 2;
+                                int x = w + r - R / 2;
+                                float ip = 0;
+                                if (y >= 0 && y < H && x >= 0 && x < W)
+                                    ip = (float)(input[INDEX_NHWC(n, c, y, x)]);
+                                op += ip * filter;
+                            }   // r
+                        }   // s
+                    }   // c
+
+                    if (bias)
+                        op += (float)(bias[k]);
+
+                    if (relu && op < 0)
+                        op = 0;
+
+                    output[INDEX_NHWC(n, k, h, w)] = (T)op;
+                }   // w
+            } // h
+        } // k
+    } // n
+
+    auto end = std::chrono::system_clock::now();
+    double ops = (2.0 * N * W * H * K * C * S * R);
+    std::chrono::duration<double> elapsed_seconds = end - start;
+    double  time = (elapsed_seconds * 1000.0).count();
+    double gflops = ops / (1000000 * time);
+    printf("\nDone, CPU time: %g ms, gflops: %g\n", time, gflops);
 }
 
 
@@ -507,6 +571,8 @@ void convTest_Winograd4x4Matmul(T *output, const T *input, const T *weight, cons
     T *transformedInput = new T[12 * 12 * N * C];
     T *transformedOutput = new T[12 * 12 * N * K];	
 
+    auto start = std::chrono::system_clock::now();
+
     // 1. transform the filter(s)
     for (int k = 0; k < K; k++)
     {
@@ -576,6 +642,7 @@ void convTest_Winograd4x4Matmul(T *output, const T *input, const T *weight, cons
 
 
     // 3. Batch of matrix multiplies to get transformed output (in HWNK layout).
+    // This is the bulk of the computation (and on CPU it takes ~95% of total conv time)
     for (int h=0;h<12;h++)
         for (int w = 0; w < 12; w++)
         {
@@ -586,7 +653,7 @@ void convTest_Winograd4x4Matmul(T *output, const T *input, const T *weight, cons
                                      &(transformedFilter[fh*6*C*K + fw*C*K]));
         }
 
-    // 4. transform the result back 
+    // 4. Transform the result back.
     for (int n = 0; n < N; n++)
     {
         for (int h = 0; h < H; h += 4)
@@ -628,10 +695,54 @@ void convTest_Winograd4x4Matmul(T *output, const T *input, const T *weight, cons
     } // n
 
 
+    auto end = std::chrono::system_clock::now();
+    double ops = (2.0 * N * W * H * K * C * S * R);
+    std::chrono::duration<double> elapsed_seconds = end - start;
+    double  time = (elapsed_seconds * 1000.0).count();
+    double gflops = ops / (1000000 * time);
+    printf("\nDone, CPU time: %g ms, gflops: %g\n", time, gflops);
+
 
     delete[]transformedFilter;
     delete[]transformedInput;
     delete[]transformedOutput;
+
+
+    // Note on why such multi-pass approach won't work on GPU with tensor cores
+    // 
+    // TLDR; Winograd reduces computational density of the problem making it more memory bound
+    //       The ratio of Flops to Memory-bandwidth with Tensor cores makes it a net loss!
+    // 
+    // Details:
+    /*
+    Memory bandwidth usage (in elements, for 256 batch size) :
+
+    1. Input transform :
+       orig size            +   transformed size
+      (256 * 256 * 8 * 8)   +  (256 * 256 * 12 * 12)
+
+    2. Mat mul (sizes of transformed input and output and tensor):
+      (256 * 256 * 12 * 12) * 3
+      Note: Tensor is smaller 256x256x6x6 but is unlikely to be re-used across batched-gemms?
+
+    3. Output transform (same memory requirment as input transform):
+      transformed size      +   orig size
+     (256 * 256 * 12 * 12)  +  (256 * 256 * 8 * 8)
+
+    Total for fp16 datatype = 111149056 bytes
+
+    assuming 400GBps of achieved memory bandwidth (e.g, for RTX Titan):
+    278 microseconds
+    cudnn implicit_precomp_gemm already does the whole convolution in 247 microseconds (~78 Tflops of tensor math util)
+
+    Best case: assuming 500GBps of bandwidth, and filter tensor read only once for batched gemm:
+    Mat mul : (256 * 256 * 12 * 12) * 2 + (256 * 256 * 6 * 6)
+        = total 96993280 bytes
+        still 193.98656 microseconds
+        (only 27 % faster than implicit_gemm in best case -> will be much worse for smaller batch sizes)
+    */
+
+    // Only hope to make winograd work with tensor cores is to try a fused kernel (doing input and output transforms on the fly)
 }
 
 
@@ -700,10 +811,11 @@ void cudnnConvTest(T *output, T *input, T *filter, T *bias, bool relu)
         n, c,
         h, w);
 
-    convAlgo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD;
+    convAlgo = CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED;
     if (fp16)
     {
         status = cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH);
+        convAlgo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
     }
 
     void *workspace = NULL;
@@ -746,7 +858,7 @@ void cudnnConvTest(T *output, T *input, T *filter, T *bias, bool relu)
     float msecTotal = 0.0f;
     cudaEventElapsedTime(&msecTotal, start, stop);
     double TFlops = (2.0 * N * W * H * K * C * S * R * loops) / (msecTotal * 1000000000.0);
-    printf("Cudnn TFlops: %g\n\n", TFlops);
+    printf("Cudnn: Time: %gms, TFlops: %g\n\n", msecTotal/loops, TFlops);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -2662,14 +2774,14 @@ void convCuda(T *output, const T *input, const T *weight, const T *bias, bool re
     float msecTotal = 0.0f;
     cudaEventElapsedTime(&msecTotal, start, stop);
     double TFlops = (2.0 * N * W * H * K * C * S * R * loops) / (msecTotal * 1000000000.0);
-    printf("CUDA TFlops: %g\n\n", TFlops);
+    printf("CUDA: Time: %gms, TFlops: %g\n\n", msecTotal/loops, TFlops);
 
 }
 
 
 int main()
 {
-    // cudaSetDevice(1);
+    //cudaSetDevice(1);
 
     float ip[2 * 2] =  {
         5, 7,
@@ -2694,7 +2806,7 @@ int main()
 
     constexpr bool fp16 = false;
 
-    constexpr int N = 1;
+    constexpr int N = 256;
     constexpr int C = 256;
     constexpr int K = 256;
     constexpr int H = 8;
@@ -2742,7 +2854,7 @@ int main()
 #if 1
     if (fp16)
     {
-        convRef<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+        convRef_NHWC<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
     }
     else
     {
@@ -2756,7 +2868,7 @@ int main()
     // convolution using cudnn
     if (fp16)
     {
-        cudnnConvTest<N, K, C, H, W, F, F>((half*)output, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+        cudnnConvTest<N, K, C, H, W, F, F>((half*)output, (half*)input, (half*)filter, (half*)bias, true);
     }
     else
     {
@@ -2768,7 +2880,8 @@ int main()
     // convolution using our own Cuda C kernel
     if (fp16)
     {
-        convCuda<N, K, C, H, W, F, F>((half*)output, (half*)input, (half*)filter, (half*)bias, true);
+        //convCuda<N, K, C, H, W, F, F>((half*)output, (half*)input, (half*)filter, (half*)bias, true);
+        // not implemented yet
     }
     else
     {
