@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-constexpr int loops = 100;
+constexpr int loops = 1000;
 
 
 #define INDEX_NCHW(n,c,h,w) ((n)*C*H*W + (c)*H*W + (h)*W + w)
@@ -554,26 +554,11 @@ void convRef_Winograd4x4(T *output, const T *input, const T *weight, const T *bi
     } // n
 }
 
-// same as above but try:
-// 1. transform the entire filter tensor at one go (into HWCK layout)
-//      -- e.g: 6x6x256x256
-// 2. transform the entire input tensor at one go (into HWNC layout)
-//      -- e.g: 12x12x100x256
-// 3. perform batched matrix multiplications (12x12 of them) to get entire output tensor in transformed space
-//      -- again in HWNK layout, e.g: 12x12x100x256
-// 4. transform the entire output tensor in one go (into required output layout - i.e, NCHW)
-template<int N, int K, int C, int H, int W, int S, int R, typename T>
-void convTest_Winograd4x4Matmul(T *output, const T *input, const T *weight, const T *bias, bool relu)
+// transform KCSR (256x256x3x3) filter for winograd
+// output is 6x6x256x256
+template<int K, int C, int S, int R, typename T>
+void transformFilterTensor_Winograd4x4(T *transformedFilter, const T *weight)
 {
-    T *transformedFilter = new T[6 * 6 * C * K];
-
-    // 2x2 = 4 tiles of size 4x4 per board (8x8 = 64 elements), transformed tiles are 6x6
-    T *transformedInput = new T[12 * 12 * N * C];
-    T *transformedOutput = new T[12 * 12 * N * K];	
-
-    auto start = std::chrono::system_clock::now();
-
-    // 1. transform the filter(s)
     for (int k = 0; k < K; k++)
     {
         for (int c = 0; c < C; c++)
@@ -594,11 +579,35 @@ void convTest_Winograd4x4Matmul(T *output, const T *input, const T *weight, cons
             for (int i = 0; i < 6; i++)
                 for (int j = 0; j < 6; j++)
                 {
-                    transformedFilter[i*6*C*K + j*C*K + c*K + k] = transformedFilterTile[i][j];
+                    transformedFilter[i * 6 * C*K + j*C*K + c*K + k] = transformedFilterTile[i][j];
                 }
 
         }
     }
+
+}
+
+// same as above but try:
+// 1. transform the entire filter tensor at one go (into HWCK layout)
+//      -- e.g: 6x6x256x256
+// 2. transform the entire input tensor at one go (into HWNC layout)
+//      -- e.g: 12x12x100x256
+// 3. perform batched matrix multiplications (12x12 of them) to get entire output tensor in transformed space
+//      -- again in HWNK layout, e.g: 12x12x100x256
+// 4. transform the entire output tensor in one go (into required output layout - i.e, NCHW)
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+void convTest_Winograd4x4Matmul(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    T *transformedFilter = new T[6 * 6 * C * K];
+
+    // 2x2 = 4 tiles of size 4x4 per board (8x8 = 64 elements), transformed tiles are 6x6
+    T *transformedInput = new T[12 * 12 * N * C];
+    T *transformedOutput = new T[12 * 12 * N * K];	
+
+    auto start = std::chrono::system_clock::now();
+
+    // 1. transform the filter(s)
+    transformFilterTensor_Winograd4x4<K, C, S, R, T>(transformedFilter, weight);
 
     // 2. transform the input
     for (int n = 0; n < N; n++)
@@ -684,7 +693,7 @@ void convTest_Winograd4x4Matmul(T *output, const T *input, const T *weight, cons
                             if (bias)
                                 opTile[i][j] += (float)(bias[k]);
 
-                            if (relu && opTile[i][j] < 0)
+                            if (relu && (float)opTile[i][j] < 0)
                                 opTile[i][j] = 0;
 
                             output[INDEX_NCHW(n, k, h + i, w + j)] = opTile[i][j];
@@ -2466,6 +2475,281 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 #endif
 
 
+#if 0
+// Assumes  
+// - S == R == 3
+// - H == W == 8
+// 
+// Optimizations:
+// - some spatial reuse for input tensor using shfl
+// - do multiple elements in H and W dimensions (4x4) per thread, to get more spatial reuse for input tensor as well as filter
+// - C dimension is sliced into multiple chunks (of 32) to reduce shared memory usage to get better occupancy (allow more blocks per SM)
+// - multiple elements (2) in K dimension processed by thread
+//   -- this gets more reuse of the input tensor
+// - another slicing along C dimension to increase occupancy
+//   -- every alternate thread writes output (i.e, two threads compute 
+
+constexpr int wPerThread = 4;
+constexpr int hPerThread = 4;
+
+// 32 threads in block
+constexpr int blockWidth  = 4;  // one board (4 threads, with 16 elements per thread)
+constexpr int blockHeight = 8;  // different 'C' dimensions
+
+// the code to do final sums and to write outputs below assumes this to be 2
+constexpr int blockDepth = 2;   // again different 'C' dimension (in a block of shared memory accessed by different warps)
+
+// these many filter elements from c dimension are loaded into 
+// shared memory at a time (should be a multiple of warp size)
+constexpr int cPerIter = 32;
+constexpr int cPerIterPerThread = cPerIter / (blockHeight);
+
+constexpr int kPerBlock = 2;
+
+#define SH_FILTER_IDX(k,c,h,w) ((k)*cPerIter*S*R + (c)*S*R + (h)*R + w)
+
+template<int N, int K, int C, int H, int W, int S, int R, typename T>
+__global__ void convKernel(T *output, const T *input, const T *weight, const T *bias, bool relu)
+{
+    int n = blockIdx.y;
+    int kStart = blockIdx.x * kPerBlock;
+
+    int hStart = (threadIdx.x >> 1) * hPerThread;
+    int wStart = (threadIdx.x  & 1) * wPerThread;
+
+    // extra offset
+    int cPerSlice = C / blockDepth;
+    int cStart = threadIdx.z * cPerSlice;
+    int shStart = (kPerBlock*cPerIter*R*S)*threadIdx.z;
+
+    // offset to be added to get C index
+    int cOffset = threadIdx.y * cPerIterPerThread;
+
+    int threadInWarp = threadIdx.y * blockWidth + threadIdx.x;
+
+    __shared__ float shData[blockDepth * kPerBlock * cPerIter * R * S];
+
+    // accumulators
+    float op[kPerBlock][4][4];
+
+    #pragma unroll 
+    for (int lk = 0; lk < kPerBlock; lk++)
+        #pragma unroll
+        for (int y = 0; y < hPerThread; y++)
+            #pragma unroll
+            for (int x = 0; x < wPerThread; x++)
+                op[lk][y][x] = 0;
+
+    // outer loop
+    // #pragma unroll 4
+    for (int cBase = 0; cBase < cPerSlice; cBase += cPerIter)
+    {
+        // load filters into shared memory
+        #pragma unroll 
+        for (int lk = 0; lk < kPerBlock; lk++)
+        {
+            int k = kStart + lk;
+            #pragma unroll
+            for (int i = 0; i < cPerIter*R*S / 32; i++)
+            {
+                int localIndex = 32 * i + threadInWarp;
+                int sharedIndex = shStart + lk * (cPerIter*R*S) + localIndex;
+                int globalIndex = k * (C*R*S) + (cStart + cBase) * (R*S) + localIndex;
+                shData[sharedIndex] =  weight[globalIndex];
+            }
+        }
+
+        #pragma unroll
+        for (int lc = 0; lc < cPerIterPerThread; lc++)
+        {
+            int shc = cOffset + lc;     // offset of filter for index c in shared memory
+            int c = cStart + cBase + shc;        // real c dimension
+
+            // hardcoded for 3x3 filter, and 4x4 spatial elements per thread
+            float inEl[hPerThread+2][wPerThread+2];
+            #pragma unroll
+            for (int y = 0; y < hPerThread+2; y++)
+                #pragma unroll
+                for (int x = 0; x < wPerThread+2; x++)
+                    inEl[y][x] = 0.0f;
+
+
+            // assume wPerThread == 4, and use a 128 bit reads
+            *((uint4*)(&inEl[1][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart, wStart)]));
+            *((uint4*)(&inEl[2][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart + 1, wStart)]));
+            *((uint4*)(&inEl[3][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart + 2, wStart)]));
+            *((uint4*)(&inEl[4][1])) = *((uint4*)(&input[INDEX_NCHW(n, c, hStart + 3, wStart)]));
+
+            // need temps because shfl needs all threads in warp to participate
+            float t01 = __shfl_up_sync(0xFFFFFFFF, inEl[4][1], 2);
+            float t02 = __shfl_up_sync(0xFFFFFFFF, inEl[4][2], 2);
+            float t03 = __shfl_up_sync(0xFFFFFFFF, inEl[4][3], 2);
+            float t04 = __shfl_up_sync(0xFFFFFFFF, inEl[4][4], 2);
+            if (hStart != 0)
+            {
+                inEl[0][1] = t01;
+                inEl[0][2] = t02;
+                inEl[0][3] = t03;
+                inEl[0][4] = t04;
+            }
+
+            float t51 = __shfl_down_sync(0xFFFFFFFF, inEl[1][1], 2);
+            float t52 = __shfl_down_sync(0xFFFFFFFF, inEl[1][2], 2);
+            float t53 = __shfl_down_sync(0xFFFFFFFF, inEl[1][3], 2);
+            float t54 = __shfl_down_sync(0xFFFFFFFF, inEl[1][4], 2);
+            if (hStart == 0)
+            {
+                inEl[5][1] = t51;
+                inEl[5][2] = t52;
+                inEl[5][3] = t53;
+                inEl[5][4] = t54;
+            }
+
+            float t00 = __shfl_up_sync(0xFFFFFFFF, inEl[0][4], 1);
+            float t10 = __shfl_up_sync(0xFFFFFFFF, inEl[1][4], 1);
+            float t20 = __shfl_up_sync(0xFFFFFFFF, inEl[2][4], 1);
+            float t30 = __shfl_up_sync(0xFFFFFFFF, inEl[3][4], 1);
+            float t40 = __shfl_up_sync(0xFFFFFFFF, inEl[4][4], 1);
+            float t50 = __shfl_up_sync(0xFFFFFFFF, inEl[5][4], 1);
+            if (wStart != 0)
+            {
+                inEl[0][0] = t00;
+                inEl[1][0] = t10;
+                inEl[2][0] = t20;
+                inEl[3][0] = t30;
+                inEl[4][0] = t40;
+                inEl[5][0] = t50;
+            }
+
+            float t05 = __shfl_down_sync(0xFFFFFFFF, inEl[0][1], 1);
+            float t15 = __shfl_down_sync(0xFFFFFFFF, inEl[1][1], 1);
+            float t25 = __shfl_down_sync(0xFFFFFFFF, inEl[2][1], 1);
+            float t35 = __shfl_down_sync(0xFFFFFFFF, inEl[3][1], 1);
+            float t45 = __shfl_down_sync(0xFFFFFFFF, inEl[4][1], 1);
+            float t55 = __shfl_down_sync(0xFFFFFFFF, inEl[5][1], 1);
+            if (wStart == 0)
+            {
+                inEl[0][5] = t05;
+                inEl[1][5] = t15;
+                inEl[2][5] = t25;
+                inEl[3][5] = t35;
+                inEl[4][5] = t45;
+                inEl[5][5] = t55;
+            }
+
+            #pragma unroll
+            for (int s = 0; s < S; s++)
+            {
+                #pragma unroll
+                for (int r = 0; r < R; r++)
+                {
+                    #pragma unroll 
+                    for (int lk = 0; lk < kPerBlock; lk++)
+                    {
+                        float wt = (float)(shData[shStart + SH_FILTER_IDX(lk, shc, s, r)]);
+                        //float wt = weight[FILTER_IDX_NCHW(kStart + lk, c, s, r)];
+                        #pragma unroll
+                        for (int y = 0; y < hPerThread; y++)
+                        {
+                            #pragma unroll
+                            for (int x = 0; x < wPerThread; x++)
+                            {
+                                op[lk][y][x] += inEl[y + s][x + r] * wt;
+                            }   // x
+                        }   // y
+                    }   // k
+                }   // r
+            } // s
+        } // lc
+    }   // cBase
+
+
+    #pragma unroll
+    for (int y = 0; y < hPerThread; y++)
+    {
+        #pragma unroll
+        for (int x = 0; x < wPerThread; x++)
+        {
+            // sum across C dimension
+            #pragma unroll 
+            for (int lk = 0; lk < kPerBlock; lk++)
+            {
+                op[lk][y][x] += __shfl_down_sync(0xFFFFFFFF, op[lk][y][x], 4);
+                op[lk][y][x] += __shfl_down_sync(0xFFFFFFFF, op[lk][y][x], 8);
+                op[lk][y][x] += __shfl_down_sync(0xFFFFFFFF, op[lk][y][x], 16);
+            }
+        }
+    }
+
+
+    //__shared__ float shResult[blockWidth][kPerBlock][hPerThread][wPerThread];
+    static_assert(sizeof(shData) >= 2*sizeof(float)*blockWidth*kPerBlock*hPerThread*wPerThread, "shared mem not enough");
+
+    if (threadIdx.y == 0 && threadIdx.z == 0)
+    {
+        #pragma unroll 
+        for (int lk = 0; lk < kPerBlock; lk++)
+            #pragma unroll 
+            for (int y = 0; y < hPerThread; y++)
+                #pragma unroll
+                for (int x = 0; x < wPerThread; x++)
+                {
+                    //shResult[threadIdx.x][lk][y][x] = op[lk][y][x];
+                    shData[threadIdx.x * kPerBlock * hPerThread * wPerThread + lk * hPerThread * wPerThread
+                           + y * wPerThread + x] = op[lk][y][x];
+                }
+    }
+    
+    __syncthreads();
+
+    if (threadIdx.y == 0 && threadIdx.z == 1)
+    {
+        float b[kPerBlock];
+        #pragma unroll 
+        for (int lk = 0; lk < kPerBlock; lk++)
+            b[lk] = bias ? bias[kStart + lk] : 0;
+
+
+        #pragma unroll
+        for (int y = 0; y < hPerThread; y++)
+        {
+            // sum across C dimension
+            #pragma unroll 
+            for (int lk = 0; lk < kPerBlock; lk++)
+            {
+                // apply bias and relu
+                #pragma unroll
+                for (int x = 0; x < wPerThread; x++)
+                {
+                    //op[lk][y][x] += shResult[threadIdx.x][lk][y][x];
+                    op[lk][y][x] += shData[threadIdx.x * kPerBlock * hPerThread * wPerThread + lk * hPerThread * wPerThread
+                                           + y * wPerThread + x];
+
+                    op[lk][y][x] += b[lk];
+
+                    if (relu && op[lk][y][x] < 0)
+                        op[lk][y][x] = 0;
+                }
+
+            }
+        }
+
+        // final memory write
+        #pragma unroll 
+        for (int lk = 0; lk < kPerBlock; lk++)
+        {
+            int k = kStart + lk;
+            ((uint4 *)output)[INDEX_NCHW(n, k, hStart, wStart) >> 2] = *((uint4 *)&op[lk][0][0]);
+            ((uint4 *)output)[INDEX_NCHW(n, k, hStart + 1, wStart) >> 2] = *((uint4 *)&op[lk][1][0]);
+            ((uint4 *)output)[INDEX_NCHW(n, k, hStart + 2, wStart) >> 2] = *((uint4 *)&op[lk][2][0]);
+            ((uint4 *)output)[INDEX_NCHW(n, k, hStart + 3, wStart) >> 2] = *((uint4 *)&op[lk][3][0]);
+        }
+    }
+    
+}
+#endif
+
+
 #if 1
 // Assumes  
 // - S == R == 3
@@ -2741,6 +3025,7 @@ __global__ void convKernel(T *output, const T *input, const T *weight, const T *
 #endif
 
 
+
 template<int N, int K, int C, int H, int W, int S, int R, typename T>
 void convCuda(T *output, const T *input, const T *weight, const T *bias, bool relu)
 {
@@ -2779,6 +3064,377 @@ void convCuda(T *output, const T *input, const T *weight, const T *bias, bool re
 }
 
 
+template<int M, int N, int K>
+__device__ __forceinline__ void matrixMul_gpu_serial(half *c, const half *a, const half *b)
+{
+    // TODO: see if this can become a bottleneck. Compiler should be using HFMA2s
+    // already, if not, try writing it in a way that is easier for compiler to optimize
+    #pragma unroll
+    for (int i = 0; i < M; ++i)
+        #pragma unroll
+        for (int j = 0; j < N; ++j)
+        {
+            half S = 0;
+            #pragma unroll
+            for (int k = 0; k < K; ++k)
+                S += a[i*K + k] * b[k*N + j];
+            c[i*N + j] = S;
+        }
+}
+
+__device__ __forceinline__ void inputTransform4x4_gpu(half *transformedInput, const half *input)
+{
+    // transform applied to input tile (of size 4x4)
+    const half Bt[6 * 6] = {
+        4,  0, -5,  0, 1, 0,
+        0, -4, -4,  1, 1, 0,
+        0,  4, -4, -1, 1, 0,
+        0, -2, -1,  2, 1, 0,
+        0,  2, -1, -2, 1, 0,
+        0,  4,  0, -5, 0, 1
+    };
+
+    const half B[6 * 6] =
+    {
+        4,  0,  0,  0,  0,  0,
+        0, -4,  4, -2,  2,  4,
+       -5, -4, -4, -1, -1,  0,
+        0,  1, -1,  2, -2, -5,
+        1,  1,  1,  1,  1,  0,
+        0,  0,  0,  0,  0,  1
+    };
+
+    half tempIp1[6 * 6];
+    matrixMul_gpu_serial<6, 6, 6>(tempIp1, Bt, input);
+    matrixMul_gpu_serial<6, 6, 6>(transformedInput, tempIp1, B);
+}
+
+__device__ __forceinline__ void outputTransform4x4_gpu(half *output, const half *transformedOutput)
+{
+    // transform applied to result
+    const half At[4 * 6] = {
+        1, 1, 1, 1, 1, 0,
+        0, 1,-1, 2,-2, 0,
+        0, 1, 1, 4, 4, 0,
+        0, 1,-1, 8,-8, 1
+    };
+
+    const half A[6 * 4] = {
+        1, 0, 0, 0,
+        1, 1, 1, 1, 
+        1,-1, 1,-1,
+        1, 2, 4, 8,
+        1,-2, 4,-8,
+        0, 0, 0, 1
+    };
+
+    half tempOp[4 * 6];
+    matrixMul_gpu_serial<4, 6, 6>(tempOp, At, transformedOutput);
+    matrixMul_gpu_serial<4, 4, 6>(output, tempOp, A);
+}
+
+
+#include <mma.h>
+using namespace nvcuda;
+
+// three phases
+// 1. * Each thread reads a 4x4 input, and transforms it into a 6x6 chunk
+//      - 18 warps - 576 threads/block. (old idea: 256 threads per block)
+//      - can even do 18 warps, one 6x6 chunk per thread (only 2 wasted warps in first and third pass!)
+//      - 16 (N dimension) * 32 (C dimension) total chunks processed by each thread block at a time
+//      -  => 2 items per thread (in C dimension?) / or only 1 when using 18 warps!
+//      - The transformed items (6x6x16x32) are written to shared memory (~36 KB)
+//    * Each thread also loads 6x6 chunks of filters into shared memory
+//      - 32 (c dimension) x 32 (k dimension) filters loaded
+//       (can possibly avoid writing them to shared memory, maybe have these directly read from
+//        device memory to per-warp matrix fragments)
+//
+//    * probably makes sense to store transformed filter/input in HWNC layout (6x6x16x32/6x6x32x32)
+// 
+// 2.  * Sets of each spatial element of a 6x6 chunk is a work item. Work items are 16x32x32 in size
+//     * 36 of them per thread block
+//     *  with 18 warps per block, 2 per warp
+//     * each warp loads a work item into warp wide MMA fragment objects
+//           - either from shared memory (for input), or
+//           - from global memory (for filter)
+//     * 4 16x16 MMAs per item (of size 16x32x32). 2 x 2 (x16x16) accumulators per warp (sounds decent)
+// 
+//     // After finishing the complete outer loop over C (256/32 = 8 iterations), i.e, steps 1 and 2
+//        -- Write result of MMAs from MMA fragments to shared memory (still 18 warps can do their job)
+//
+// 3. Similar to stage 1, 16 warps active, each thread transforms a 6x6 output tile into a 4x4 tile and writes it out to memory
+
+// index of transformed filter
+#define FILTER_IDX_HWCK(h,w,c,k) ((h)*6*C*K + (w)*C*K + (c)*K + k)
+
+template<int K, int C>
+__global__ void convKernel_fp16_winograd(half *output, const half *input, const half *weight, const half *bias, bool relu)
+{
+    constexpr int H = 8, W = 8;
+
+    // holds transformed input or output
+    constexpr int shPitch = 32;     // see if padding this up to 40 improves performance
+    __shared__ half shMem[6][6][16][shPitch];
+
+    int laneIndex = threadIdx.x;
+    int warpInBlock = threadIdx.y;
+
+    int nStart = blockIdx.z * 16;
+    int kStart = blockIdx.y * 32;
+
+    int hStart = (blockIdx.x >> 1) * 4;
+    int wStart = (blockIdx.x & 1) * 4;
+
+    // the accumulators (registers allocated warp wide)
+    // each warp does two work-items (each work item is 16x32), so there are 2x2 accumulators
+    wmma::fragment<wmma::accumulator, 16, 16, 16, half> out[2][2];
+
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++)
+            wmma::fill_fragment(out[i][j], 0.0f);
+
+
+    for (int cStart = 0; cStart < C; cStart += 32)
+    {
+        // Phase 1, only 16 of 18 warps active
+        if (warpInBlock < 16)
+        {
+            int lc = laneIndex;
+            int ln = warpInBlock;
+
+            int c = cStart + lc;
+            int n = nStart + ln;
+
+            half inEl[6][6];
+
+            #pragma unroll
+            for (int y = 0; y < 6; y++)
+                #pragma unroll
+                for (int x = 0; x < 6; x++)
+                    inEl[y][x] = 0.0f;
+
+
+            // i) Read central elements 
+            // use a 64 bit reads
+            *((uint2*)(&inEl[1][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart, wStart)]));
+            *((uint2*)(&inEl[2][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart + 1, wStart)]));
+            *((uint2*)(&inEl[3][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart + 2, wStart)]));
+            *((uint2*)(&inEl[4][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart + 3, wStart)]));
+
+#if 0
+            // even this doesn't work!??!!
+            #pragma unroll
+            for (int y = 0; y < 6; y++)
+                #pragma unroll
+                for (int x = 0; x < 6; x++)
+                {
+                    int h = (hStart + y - 1);
+                    int w = (wStart + x - 1);
+                    if (h >= 0 && h < 8 && w >= 0 && w < 8)
+                    {
+                        inEl[y][x] = input[INDEX_NCHW(n, c, h, w)];
+                    }
+                    else
+                    {
+                        inEl[y][x] = 0;
+                    }
+                }
+#endif
+
+            
+            if (hStart != 0)
+            {
+                // read top row
+                *((uint2*)(&inEl[0][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart-1, wStart)]));
+            }
+            else
+            {
+                // read bottom row
+                *((uint2*)(&inEl[5][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart + 4, wStart)]));
+            }
+
+            if (wStart != 0)
+            {
+                // read left column (sad slow reads)
+                inEl[1][0] = input[INDEX_NCHW(n, c, hStart + 0, wStart - 1)];
+                inEl[2][0] = input[INDEX_NCHW(n, c, hStart + 1, wStart - 1)];
+                inEl[3][0] = input[INDEX_NCHW(n, c, hStart + 2, wStart - 1)];
+                inEl[4][0] = input[INDEX_NCHW(n, c, hStart + 3, wStart - 1)];
+
+                if (hStart != 0)
+                    inEl[0][0] = input[INDEX_NCHW(n, c, hStart - 1, wStart - 1)];
+                else
+                    inEl[5][0] = input[INDEX_NCHW(n, c, hStart + 4, wStart - 1)];
+            }
+            else
+            {
+                // read right column (again very slow reads)
+                inEl[1][5] = input[INDEX_NCHW(n, c, hStart + 0, wStart + 4)];
+                inEl[2][5] = input[INDEX_NCHW(n, c, hStart + 1, wStart + 4)];
+                inEl[3][5] = input[INDEX_NCHW(n, c, hStart + 2, wStart + 4)];
+                inEl[4][5] = input[INDEX_NCHW(n, c, hStart + 3, wStart + 4)];
+
+                if (hStart != 0)
+                    inEl[0][5] = input[INDEX_NCHW(n, c, hStart - 1, wStart + 4)];
+                else
+                    inEl[5][5] = input[INDEX_NCHW(n, c, hStart + 4, wStart + 4)];
+            }
+
+            // ii) transform it
+            inputTransform4x4_gpu(&inEl[0][0], &inEl[0][0]);
+
+            // iii) write to shared memory
+            #pragma unroll
+            for (int y = 0; y < 6; y++)
+                #pragma unroll
+                for (int x = 0; x < 6; x++)
+                    shMem[y][x][ln][lc] = inEl[y][x];
+        }
+
+        __syncthreads();
+
+        // phase 2. Read filter, and perform the matrix-multiplies
+        // 6x6 = 36 work items / 18 warps, each warp does two work items
+
+        int x = warpInBlock % 6;    // 0..5
+        int y = warpInBlock / 6;    // 0..2
+
+        #pragma unroll
+        for (int i = 0; i < 2; i++)
+        {
+            y += i * 3;
+
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> inp[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> filter[2];
+
+            // read input (from shared memory)
+            wmma::load_matrix_sync(inp[0], &(shMem[y][x][0][0]), shPitch);
+            wmma::load_matrix_sync(inp[1], &(shMem[y][x][0][16]), shPitch);
+
+            // read filter (from global memory)
+            // filter is in HWCK layout with H=W=6, and C/K typically 256
+
+            // first 16x16 chunk
+            wmma::load_matrix_sync(filter[0], &(weight[FILTER_IDX_HWCK(y, x, cStart, kStart)]), K);
+            wmma::load_matrix_sync(filter[1], &(weight[FILTER_IDX_HWCK(y, x, cStart + 16, kStart)]), K);
+
+            wmma::mma_sync(out[i][0], inp[0], filter[0], out[i][0]);
+            wmma::mma_sync(out[i][0], inp[1], filter[1], out[i][0]);
+
+            // second 16x16 chunk of work-item
+            wmma::load_matrix_sync(filter[0], &(weight[FILTER_IDX_HWCK(y, x, cStart, kStart+16)]), K);
+            wmma::load_matrix_sync(filter[1], &(weight[FILTER_IDX_HWCK(y, x, cStart + 16, kStart+16)]), K);
+
+            wmma::mma_sync(out[i][1], inp[0], filter[0], out[i][1]);
+            wmma::mma_sync(out[i][1], inp[1], filter[1], out[i][1]);
+        }
+    }   // outer loop for C dimension
+
+    __syncthreads();
+
+    // Phase 3. transform output, perform relu/bias and write to global memory
+
+    // i) write to shared memory
+    int x = warpInBlock % 6;    // 0..5
+    int y = warpInBlock / 6;    // 0..2
+    wmma::store_matrix_sync(&(shMem[y][x][0][0]), out[0][0], shPitch, wmma::mem_row_major);
+    wmma::store_matrix_sync(&(shMem[y][x][0][16]), out[0][1], shPitch, wmma::mem_row_major);
+    y += 3;
+    wmma::store_matrix_sync(&(shMem[y][x][0][0]), out[1][0], shPitch, wmma::mem_row_major);
+    wmma::store_matrix_sync(&(shMem[y][x][0][16]), out[1][1], shPitch, wmma::mem_row_major);
+
+    __syncthreads();
+
+    // Again, similar to Phase 1, only 16 warps (out of 18) active below
+    if (warpInBlock < 16)
+    {
+        // ii) read from shared memory to per thread registers (for doing output transform)
+        int lk = laneIndex;
+        int ln = warpInBlock;
+        half outElTransformed[6][6];
+        #pragma unroll
+        for (int y = 0; y < 6; y++)
+            #pragma unroll
+            for (int x = 0; x < 6; x++)
+                outElTransformed[y][x] = shMem[y][x][ln][lk];
+
+        // ii) transform it
+        half outEl[4][4];
+        outputTransform4x4_gpu(&outEl[0][0], &outElTransformed[0][0]);
+
+        // iii) apply relu and bias
+        half b = bias[kStart + lk];
+        #pragma unroll
+        for (int y = 0; y < 4; y++)
+            #pragma unroll
+            for (int x = 0; x < 4; x++)
+            {
+                outEl[y][x] += b;
+                if (relu && outEl[y][x] < (half)0)
+                    outEl[y][x] = 0;
+            }
+
+        // iv) write to output (use 64 bit writes to store 4 elements a time)
+        int k = kStart + lk;
+        int n = nStart + ln;
+        ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 0, wStart) >> 2] = *((uint2 *)&outEl[0][0]);
+        ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 1, wStart) >> 2] = *((uint2 *)&outEl[1][0]);
+        ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 2, wStart) >> 2] = *((uint2 *)&outEl[2][0]);
+        ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 3, wStart) >> 2] = *((uint2 *)&outEl[3][0]);
+    }
+}
+
+#if 1
+// weight contains transformed filter (6x6xCxK layout)
+template<int N, int K, int C>
+void convCudaWinograd_fp16_NCHW(half *output, const half *input, const half *weight, const half *bias, bool relu)
+{
+    // Each thread block writes 16 elements in N dimension, and 32 elements in K dimension
+    // and 4x4 elements in spatial dimensions (H x W)
+    static_assert(K % 32 == 0, "unsupported K dim");
+    static_assert(N % 16 == 0, "unsupported N dim");
+
+    dim3 gridDim((8*8)/(4*4), K / 32, N / 16);
+
+    // each thread block is 18 warps = 576 threads
+    dim3 blockDim(32, 18);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+
+    for (int i = 0; i < loops * 2; i++)
+    {
+        if (i == loops)
+            cudaEventRecord(start, NULL);
+
+        convKernel_fp16_winograd<K, C> <<<gridDim, blockDim >>> (output, input, weight, bias, relu);
+        if (i == 0)
+        {
+            cudaDeviceSynchronize();
+            cudaError err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                printf("\nCUDA ERROR: %s\n", cudaGetErrorString(err));
+            }
+        }
+    }
+
+    cudaEventRecord(stop, NULL);
+    cudaEventSynchronize(stop);
+
+    float msecTotal = 0.0f;
+    cudaEventElapsedTime(&msecTotal, start, stop);
+    double TFlops = (2.0 * N * 8 * 8 * K * C * 3 * 3 * loops) / (msecTotal * 1000000000.0);
+    printf("CUDA: Time: %gms, TFlops: %g\n\n", msecTotal / loops, TFlops);
+
+}
+#endif
+
+
 int main()
 {
     //cudaSetDevice(1);
@@ -2804,9 +3460,10 @@ int main()
     printf("win output: %f, %f,%f, %f\n", op[0], op[1], op[2], op[3]);
 
 
-    constexpr bool fp16 = false;
-
+    constexpr bool fp16 = true;
+    
     constexpr int N = 256;
+    //constexpr int N = 16;
     constexpr int C = 256;
     constexpr int K = 256;
     constexpr int H = 8;
@@ -2828,33 +3485,58 @@ int main()
     void *coutput = malloc(outputBytes);
     void *cfilter = malloc(filterBytes);
     void *cbias = malloc(biasBytes);
+    void *ctransformedFilter = malloc(filterBytes * 4);
 
     fillRandomArray(cinput, inputElements, fp16);
     fillRandomArray(cfilter, filterElements, fp16);
     fillRandomArray(cbias, biasElements, fp16);
 
+    if (fp16)
+    {
+        // bug! some issue with fp16 winograd transform for filter tensor on CPU! ??!!
+        //transformFilterTensor_Winograd4x4<K, C, F, F, half>((half *)ctransformedFilter, (half*)cfilter);
+
+        // Ankan - test : higher prcesion filter transform
+        void *tempFilter = malloc(filterElements * sizeof(float));
+        for (int i = 0; i < filterElements; i++)
+            ((float*)tempFilter)[i] = ((half*) cfilter)[i];
+
+        void *tempFilterTransformed = malloc(filterElements * sizeof(float) * 4);
+        transformFilterTensor_Winograd4x4<K, C, F, F, float>((float *)tempFilterTransformed, (float*)tempFilter);
+
+        for (int i = 0; i < filterElements * 4; i++)
+            ((half*)ctransformedFilter)[i] = ((float*)tempFilterTransformed)[i];
+    }
+    else
+    {
+        transformFilterTensor_Winograd4x4<K, C, F, F, float>((float *)ctransformedFilter, (float*)cfilter);
+    }
 
     void *input;
     void *output;
     void *filter;
     void *bias;
+    void *transformedFilter;
 
     cudaMalloc(&input, inputBytes);
     cudaMalloc(&output, outputBytes);
     cudaMalloc(&filter, filterBytes);
     cudaMalloc(&bias, biasBytes);
+    cudaMalloc(&transformedFilter, filterBytes * 4);
 
     cudaMemcpy(input, cinput, inputBytes, cudaMemcpyHostToDevice);
     cudaMemcpy(filter, cfilter, filterBytes, cudaMemcpyHostToDevice);
     cudaMemcpy(bias, cbias, biasBytes, cudaMemcpyHostToDevice);
-
+    cudaMemcpy(transformedFilter, ctransformedFilter, 4*filterBytes, cudaMemcpyHostToDevice);
 
     // convolution using cpu ref
     void *crefop = malloc(outputBytes);
 #if 1
     if (fp16)
     {
-        convRef_NHWC<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+        // buggy: convTest_Winograd4x4Matmul<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+        convRef<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
+        //convRef_NHWC<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
     }
     else
     {
@@ -2882,10 +3564,12 @@ int main()
     {
         //convCuda<N, K, C, H, W, F, F>((half*)output, (half*)input, (half*)filter, (half*)bias, true);
         // not implemented yet
+        convCudaWinograd_fp16_NCHW<N, K, C>((half*)output, (half*)input, (half*)transformedFilter, (half*)bias, true);
     }
     else
     {
         convCuda<N, K, C, H, W, F, F>((float*)output, (float*)input, (float*)filter, (float*)bias, true);
+        //convCudaWinograd_NCHW<N, K, C>((float*)output, (float*)input, (float*)transformedFilter, (float*)bias, true);
     }
 #endif
 
@@ -2899,11 +3583,13 @@ int main()
     cudaFree(output);
     cudaFree(filter);
     cudaFree(bias);
+    cudaFree(transformedFilter);
 
     free(cinput);
     free(coutput);
     free(cfilter);
     free(cbias);
+    free(ctransformedFilter);
     return 0;
 }
 

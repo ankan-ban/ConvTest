@@ -37,7 +37,7 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
         if (bigger)
             percentError /= bigger;
 
-        if (i < 20)
+        if (i < 128)
         {
             printf("\n%04d:  %12.8f, %12.8f, .... %11.8f", i, a, b, percentError*100);
         }
