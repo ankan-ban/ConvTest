@@ -4,9 +4,13 @@
 #include <cuda_fp16.h>
 #include <cudnn.h>
 #include <chrono>
+#include <thread>
 
 #include <cstdio>
 #include <cstdlib>
+
+// OpenMP to quickly speed up cpu conv
+#include <omp.h>
 
 constexpr int loops = 1000;
 
@@ -26,8 +30,13 @@ constexpr int loops = 1000;
 template<int N, int K, int C, int H, int W, int S, int R, typename T>
 void convRef(T *output, const T *input, const T *weight, const T *bias, bool relu)
 {
+    int threads = std::thread::hardware_concurrency();
+    printf("\nthreads: %d\n", threads);
+    omp_set_num_threads(threads);
+
     auto start = std::chrono::system_clock::now();
 
+    #pragma omp parallel for
     for (int n = 0; n < N; n++)
     {
         for (int k = 0; k < K; k++)
@@ -762,7 +771,7 @@ void cudnnConvTest(T *output, T *input, T *filter, T *bias, bool relu)
 {
     bool fp16 = (sizeof(T) == sizeof(half));
     const cudnnDataType_t datatype = fp16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
-    const cudnnTensorFormat_t layout = fp16 ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
+    const cudnnTensorFormat_t layout = /*fp16 ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW*/CUDNN_TENSOR_NCHW;
 
     cudnnHandle_t cudnnHandle;
     cudnnTensorDescriptor_t inputTensor, filterTensor, outputTensor, biasDesc;
@@ -824,6 +833,11 @@ void cudnnConvTest(T *output, T *input, T *filter, T *bias, bool relu)
     if (fp16)
     {
         status = cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH);
+    }
+
+    if (layout == CUDNN_TENSOR_NHWC)
+    {
+        // winograd doesn't work with NHWC
         convAlgo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
     }
 
@@ -3195,7 +3209,6 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
         for (int j = 0; j < 2; j++)
             wmma::fill_fragment(out[i][j], 0.0f);
 
-
     for (int cStart = 0; cStart < C; cStart += 32)
     {
         // Phase 1, only 16 of 18 warps active
@@ -3216,15 +3229,8 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
                     inEl[y][x] = 0.0f;
 
 
-            // i) Read central elements 
-            // use a 64 bit reads
-            *((uint2*)(&inEl[1][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart, wStart)]));
-            *((uint2*)(&inEl[2][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart + 1, wStart)]));
-            *((uint2*)(&inEl[3][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart + 2, wStart)]));
-            *((uint2*)(&inEl[4][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart + 3, wStart)]));
-
 #if 0
-            // even this doesn't work!??!!
+            // naive one element a time reads!
             #pragma unroll
             for (int y = 0; y < 6; y++)
                 #pragma unroll
@@ -3243,7 +3249,14 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
                 }
 #endif
 
-            
+#if 1
+            // i) Read central elements 
+            // use a 64 bit reads
+            *((uint2*)(&inEl[1][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart, wStart)]));
+            *((uint2*)(&inEl[2][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart + 1, wStart)]));
+            *((uint2*)(&inEl[3][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart + 2, wStart)]));
+            *((uint2*)(&inEl[4][1])) = *((uint2*)(&input[INDEX_NCHW(n, c, hStart + 3, wStart)]));
+
             if (hStart != 0)
             {
                 // read top row
@@ -3281,6 +3294,7 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
                 else
                     inEl[5][5] = input[INDEX_NCHW(n, c, hStart + 4, wStart + 4)];
             }
+#endif
 
             // ii) transform it
             inputTransform4x4_gpu(&inEl[0][0], &inEl[0][0]);
@@ -3292,6 +3306,7 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
                 for (int x = 0; x < 6; x++)
                     shMem[y][x][ln][lc] = inEl[y][x];
         }
+
 
         __syncthreads();
 
@@ -3330,9 +3345,9 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
             wmma::mma_sync(out[i][1], inp[0], filter[0], out[i][1]);
             wmma::mma_sync(out[i][1], inp[1], filter[1], out[i][1]);
         }
-    }   // outer loop for C dimension
 
-    __syncthreads();
+        __syncthreads();
+    }   // outer loop for C dimension
 
     // Phase 3. transform output, perform relu/bias and write to global memory
 
@@ -3439,6 +3454,7 @@ int main()
 {
     //cudaSetDevice(1);
 
+#if 0
     float ip[2 * 2] =  {
         5, 7,
         11, 2
@@ -3458,7 +3474,7 @@ int main()
 
     convRef_Winograd2x2<1, 1, 1, 2, 2, 3, 3, float>(op, ip, fl, nullptr, false);
     printf("win output: %f, %f,%f, %f\n", op[0], op[1], op[2], op[3]);
-
+#endif
 
     constexpr bool fp16 = true;
     
@@ -3563,13 +3579,11 @@ int main()
     if (fp16)
     {
         //convCuda<N, K, C, H, W, F, F>((half*)output, (half*)input, (half*)filter, (half*)bias, true);
-        // not implemented yet
         convCudaWinograd_fp16_NCHW<N, K, C>((half*)output, (half*)input, (half*)transformedFilter, (half*)bias, true);
     }
     else
     {
         convCuda<N, K, C, H, W, F, F>((float*)output, (float*)input, (float*)filter, (float*)bias, true);
-        //convCudaWinograd_NCHW<N, K, C>((float*)output, (float*)input, (float*)transformedFilter, (float*)bias, true);
     }
 #endif
 

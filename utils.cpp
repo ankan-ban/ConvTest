@@ -17,6 +17,9 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
     float max_err_a = 0, max_err_b = 0;
     int max_err_index = 0;
     printf("\nFirst few elements: ");
+
+    int numPrints = 0;
+
     for (int i = 0; i < size; i++)
     {
         float a, b;
@@ -37,9 +40,16 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
         if (bigger)
             percentError /= bigger;
 
-        if (i < 128)
+        /*
+        if (i < 20)
         {
             printf("\n%04d:  %12.8f, %12.8f, .... %11.8f", i, a, b, percentError*100);
+        }
+        */
+        if (percentError > 0.01 && numPrints < 20)
+        {
+            printf("\n%04d:  %12.8f, %12.8f, .... %11.8f", i, a, b, percentError * 100);
+            numPrints++;
         }
 
         if (percentError > maxError)
