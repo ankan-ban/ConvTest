@@ -90,7 +90,6 @@
   <ItemGroup>
     <CudaCompile Include="kernel.cu">
       <CodeGeneration Condition="'$(Configuration)|$(Platform)'=='Release|x64'">compute_75,sm_75</CodeGeneration>
-      <MaxRegCount Condition="'$(Configuration)|$(Platform)'=='Release|x64'">95</MaxRegCount>
       <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-Xcompiler " -openmp" %(AdditionalOptions)</AdditionalOptions>
     </CudaCompile>
   </ItemGroup>

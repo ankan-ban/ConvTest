@@ -3480,7 +3480,7 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
     constexpr int H = 8, W = 8;
 
     // holds transformed input or output
-    constexpr int shPitch = 32;     // see if padding this up to 40 improves performance
+    constexpr int shPitch = 40;     // see if padding this up to 40 improves performance
     __shared__ half shMem[6][6][16][shPitch];   // the N dimension in this array also has spatial dimension
 
     int laneIndex = threadIdx.x;
@@ -3489,23 +3489,26 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
     int nStart = blockIdx.y * 4;
     int kStart = blockIdx.x * 32;
 
-    //int hStart = (blockIdx.x >> 1) * 4;
-    //int wStart = (blockIdx.x & 1) * 4;
-
     // the accumulators (registers allocated warp wide)
-    // each warp does two work-items (each work item is 16x32), so there are 2x2 accumulators
-    wmma::fragment<wmma::accumulator, 16, 16, 16, half> out[2][2];
+    // each warp does 9 work-items (each work item is 16x32), so there are 9x2 accumulators
+    wmma::fragment<wmma::accumulator, 16, 16, 16, half> out[3][3][2];
 
     #pragma unroll
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 3; i++)
         #pragma unroll
-        for (int j = 0; j < 2; j++)
-            wmma::fill_fragment(out[i][j], 0.0f);
+        for (int j = 0; j < 3; j++)
+            #pragma unroll
+            for (int k = 0; k < 2; k++)
+            wmma::fill_fragment(out[i][j][k], 0);
+
+    // for phase 2, starting spatial locations in transformed space (6x6 chunk)
+    int sx = (warpInBlock & 1) * 3;
+    int sy = (warpInBlock >> 1) * 3;
 
     for (int cStart = 0; cStart < C; cStart += 32)
     {
         // Phase 1, only 4 of 18 warps active
-        if (warpInBlock < 4)
+        //if (warpInBlock < 4)
         {
             int lc = laneIndex;
             int ln = warpInBlock;
@@ -3634,40 +3637,35 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
         __syncthreads();
 
         // phase 2. Read filter, and perform the matrix-multiplies
-        // 6x6 = 36 work items / 18 warps, each warp does two work items
-
-        int x = warpInBlock % 6;    // 0..5
-        int y = warpInBlock / 6;    // 0..2
+        // 6x6 = 36 work items / 4 warps, each warp does 9 work items
 
         #pragma unroll
-        for (int i = 0; i < 2; i++)
-        {
-            y += i * 3;
+        for (int i = 0; i < 3; i++)
+            #pragma unroll
+            for (int j = 0; j < 3; j++)
+            {
+                int y = sy + i;
+                int x = sx + j;
 
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> inp[2];
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> filter[2];
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> inp[2];
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> filter[2];
 
-            // read input (from shared memory)
-            wmma::load_matrix_sync(inp[0], &(shMem[y][x][0][0]), shPitch);
-            wmma::load_matrix_sync(inp[1], &(shMem[y][x][0][16]), shPitch);
+                // read input (from shared memory)
+                wmma::load_matrix_sync(inp[0], &(shMem[y][x][0][0]), shPitch);
+                wmma::load_matrix_sync(inp[1], &(shMem[y][x][0][16]), shPitch);
 
-            // read filter (from global memory)
-            // filter is in HWCK layout with H=W=6, and C/K typically 256
+                #pragma unroll
+                for (int k = 0; k < 2; k++)
+                {
+                    // read filter (from global memory)
+                    // filter is in HWCK layout with H=W=6, and C/K typically 256
+                    wmma::load_matrix_sync(filter[0], &(weight[FILTER_IDX_HWCK(y, x, cStart, kStart + k * 16)]), K);
+                    wmma::load_matrix_sync(filter[1], &(weight[FILTER_IDX_HWCK(y, x, cStart + 16, kStart + k * 16)]), K);
 
-            // first 16x16 chunk
-            wmma::load_matrix_sync(filter[0], &(weight[FILTER_IDX_HWCK(y, x, cStart, kStart)]), K);
-            wmma::load_matrix_sync(filter[1], &(weight[FILTER_IDX_HWCK(y, x, cStart + 16, kStart)]), K);
-
-            wmma::mma_sync(out[i][0], inp[0], filter[0], out[i][0]);
-            wmma::mma_sync(out[i][0], inp[1], filter[1], out[i][0]);
-
-            // second 16x16 chunk of work-item
-            wmma::load_matrix_sync(filter[0], &(weight[FILTER_IDX_HWCK(y, x, cStart, kStart+16)]), K);
-            wmma::load_matrix_sync(filter[1], &(weight[FILTER_IDX_HWCK(y, x, cStart + 16, kStart+16)]), K);
-
-            wmma::mma_sync(out[i][1], inp[0], filter[0], out[i][1]);
-            wmma::mma_sync(out[i][1], inp[1], filter[1], out[i][1]);
-        }
+                    wmma::mma_sync(out[i][j][k], inp[0], filter[0], out[i][j][k]);
+                    wmma::mma_sync(out[i][j][k], inp[1], filter[1], out[i][j][k]);
+                }
+            }
 
         __syncthreads();
     }   // outer loop for C dimension
@@ -3675,19 +3673,25 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
     // Phase 3. transform output, perform relu/bias and write to global memory
 
     // i) write to shared memory
-    int x = warpInBlock % 6;    // 0..5
-    int y = warpInBlock / 6;    // 0..2
-    wmma::store_matrix_sync(&(shMem[y][x][0][0]), out[0][0], shPitch, wmma::mem_row_major);
-    wmma::store_matrix_sync(&(shMem[y][x][0][16]), out[0][1], shPitch, wmma::mem_row_major);
-    y += 3;
-    wmma::store_matrix_sync(&(shMem[y][x][0][0]), out[1][0], shPitch, wmma::mem_row_major);
-    wmma::store_matrix_sync(&(shMem[y][x][0][16]), out[1][1], shPitch, wmma::mem_row_major);
+    #pragma unroll
+    for (int i = 0; i < 3; i++)
+        #pragma unroll
+        for (int j = 0; j < 3; j++)
+        {
+            int y = sy + i;
+            int x = sx + j;
+            wmma::store_matrix_sync(&(shMem[y][x][0][0]), out[i][j][0], shPitch, wmma::mem_row_major);
+            wmma::store_matrix_sync(&(shMem[y][x][0][16]), out[i][j][1], shPitch, wmma::mem_row_major);
+        }
 
     __syncthreads();
 
-    // Again, similar to Phase 1, only 4 warps (out of 18) active below
-    if (warpInBlock < 4)
+    // Again, similar to Phase 1
+    //if (warpInBlock < 4)
+#if 1
     {
+        half b = bias[kStart + laneIndex];
+
         for (int hStart = 0; hStart < 8; hStart+=4)
             for (int wStart = 0; wStart < 8; wStart += 4)
             {
@@ -3707,7 +3711,6 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
                 outputTransform4x4_gpu(&outEl[0][0], &outElTransformed[0][0]);
 
                 // iii) apply relu and bias
-                half b = bias[kStart + lk];
                 #pragma unroll
                 for (int y = 0; y < 4; y++)
                     #pragma unroll
@@ -3727,11 +3730,12 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
                 ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 3, wStart) >> 2] = *((uint2 *)&outEl[3][0]);
             }
     }
+#endif
 
     // write whole row at a time - actually slower!
 #if 0
     // Again, similar to Phase 1, only 4 warps (out of 18) active below
-    if (warpInBlock < 4)
+    //if (warpInBlock < 4)
     {
         half board[8][8];
 
@@ -3780,7 +3784,6 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
         #pragma unroll
         for (int y = 0; y < 8; y++)
         {
-            //((uint4 *)output)[INDEX_NCHW(n, k, y, 0) >> 4] = *((uint4 *)&board[y][0]);
             *((uint4*)(&output[INDEX_NCHW(n, k, y, 0)])) = *((uint4 *)&board[y][0]);
         }
     }
@@ -3798,8 +3801,8 @@ void convCudaWinograd_fp16_NCHW(half *output, const half *input, const half *wei
 
     dim3 gridDim(K / 32, N / 4);
 
-    // each thread block is 18 warps = 576 threads
-    dim3 blockDim(32, 18);
+    // each thread block is 4 warps = 128 threads
+    dim3 blockDim(32, 4);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
