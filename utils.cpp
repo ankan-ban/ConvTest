@@ -19,6 +19,7 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
     printf("\nFirst few elements: ");
 
     int numPrints = 0;
+    int nanCount = 0;
 
     for (int i = 0; i < size; i++)
     {
@@ -40,17 +41,18 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
         if (bigger)
             percentError /= bigger;
 
-        /*
+#if 0
         if (i < 20)
         {
             printf("\n%04d:  %12.8f, %12.8f, .... %11.8f", i, a, b, percentError*100);
         }
-        */
+#else
         if (percentError > 0.01 && numPrints < 20)
         {
             printf("\n%04d:  %12.8f, %12.8f, .... %11.8f", i, a, b, percentError * 100);
             numPrints++;
         }
+#endif
 
         if (percentError > maxError)
         {
@@ -59,7 +61,11 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
             max_err_b = b;
             max_err_index = i;
         }
-        totalError += percentError;
+
+        if (percentError == percentError)   // NaN check!
+            totalError += percentError;
+        else
+            nanCount++;
     }
 
     double avgError = totalError / size;
@@ -68,6 +74,9 @@ void compareResults(void *arr1, void *arr2, int size, bool testFp16)
 
     printf("\nMax error: %f, avg error: %f, max error pair:", maxError, avgError);
     printf("\n%04d:  %12.8f, %12.8f\n", max_err_index, max_err_a, max_err_b);
+
+    if (nanCount)   // generally bad!
+        printf("\n***NaN count: %d***\n", nanCount);
 }
 
 void fillRandomArray(void *out, int size, bool testFp16)

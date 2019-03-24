@@ -3151,6 +3151,8 @@ __device__ __forceinline__ void outputTransform4x4_gpu(half *output, const half 
 #include <mma.h>
 using namespace nvcuda;
 
+
+#if 0
 // three phases
 // 1. * Each thread reads a 4x4 input, and transforms it into a 6x6 chunk
 //      - 18 warps - 576 threads/block. (old idea: 256 threads per block)
@@ -3401,7 +3403,6 @@ __global__ void convKernel_fp16_winograd(half *output, const half *input, const 
     }
 }
 
-#if 1
 // weight contains transformed filter (6x6xCxK layout)
 template<int N, int K, int C>
 void convCudaWinograd_fp16_NCHW(half *output, const half *input, const half *weight, const half *bias, bool relu)
@@ -3412,6 +3413,390 @@ void convCudaWinograd_fp16_NCHW(half *output, const half *input, const half *wei
     static_assert(N % 16 == 0, "unsupported N dim");
 
     dim3 gridDim((8*8)/(4*4), K / 32, N / 16);
+
+    // each thread block is 18 warps = 576 threads
+    dim3 blockDim(32, 18);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+
+    for (int i = 0; i < loops * 2; i++)
+    {
+        if (i == loops)
+            cudaEventRecord(start, NULL);
+
+        convKernel_fp16_winograd<K, C> <<<gridDim, blockDim >>> (output, input, weight, bias, relu);
+        if (i == 0)
+        {
+            cudaDeviceSynchronize();
+            cudaError err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                printf("\nCUDA ERROR: %s\n", cudaGetErrorString(err));
+            }
+        }
+    }
+
+    cudaEventRecord(stop, NULL);
+    cudaEventSynchronize(stop);
+
+    float msecTotal = 0.0f;
+    cudaEventElapsedTime(&msecTotal, start, stop);
+    double TFlops = (2.0 * N * 8 * 8 * K * C * 3 * 3 * loops) / (msecTotal * 1000000000.0);
+    printf("CUDA: Time: %gms, TFlops: %g\n\n", msecTotal / loops, TFlops);
+
+}
+#endif
+
+#if 1
+// three phases
+// 1. * Each thread reads a 8x8 input, and transforms it into a 4 x 6x6 chunks
+//      - 18 warps - 576 threads/block. 
+//      - in phase 1, only 128 threads (4 warps) are active
+//      - 4 (spatial dim) x 4 (N dimension) * 32 (C dimension) total chunks processed by each thread block at a time
+//      - The transformed items 4 x (6x6x16x32) are written to shared memory (~36 KB)
+// 
+// 2.  * Sets of each spatial element of a 6x6 chunk is a work item. Work items are 16x32x32 in size
+//     * 36 of them per thread block
+//     *  with 18 warps per block, 2 per warp
+//     * each warp loads a work item into warp wide MMA fragment objects
+//           - either from shared memory (for input), or
+//           - from global memory (for filter)
+//     * 4 16x16 MMAs per item (of size 16x32x32). 2 x 2 (x16x16) accumulators per warp (sounds decent)
+// 
+//     // After finishing the complete outer loop over C (256/32 = 8 iterations), i.e, steps 1 and 2
+//        -- Write result of MMAs from MMA fragments to shared memory (still 18 warps can do their job)
+//
+// 3. Similar to stage 1, 4 warps active, each thread transforms 4x (6x6) output tile into 4x4 tiles and writes them out to memory
+
+// index of transformed filter
+#define FILTER_IDX_HWCK(h,w,c,k) ((h)*6*C*K + (w)*C*K + (c)*K + k)
+
+template<int K, int C>
+__global__ void convKernel_fp16_winograd(half *output, const half *input, const half *weight, const half *bias, bool relu)
+{
+    constexpr int H = 8, W = 8;
+
+    // holds transformed input or output
+    constexpr int shPitch = 32;     // see if padding this up to 40 improves performance
+    __shared__ half shMem[6][6][16][shPitch];   // the N dimension in this array also has spatial dimension
+
+    int laneIndex = threadIdx.x;
+    int warpInBlock = threadIdx.y;
+
+    int nStart = blockIdx.y * 4;
+    int kStart = blockIdx.x * 32;
+
+    //int hStart = (blockIdx.x >> 1) * 4;
+    //int wStart = (blockIdx.x & 1) * 4;
+
+    // the accumulators (registers allocated warp wide)
+    // each warp does two work-items (each work item is 16x32), so there are 2x2 accumulators
+    wmma::fragment<wmma::accumulator, 16, 16, 16, half> out[2][2];
+
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 2; j++)
+            wmma::fill_fragment(out[i][j], 0.0f);
+
+    for (int cStart = 0; cStart < C; cStart += 32)
+    {
+        // Phase 1, only 4 of 18 warps active
+        if (warpInBlock < 4)
+        {
+            int lc = laneIndex;
+            int ln = warpInBlock;
+
+            int c = cStart + lc;
+            int n = nStart + ln;
+
+            half board[8][8];
+
+            // read the board (a row at a time)
+            // TODO: can also use more threads to read in better coleased manner!
+            for (int y = 0; y < 8; y++)
+            {
+                *((uint4*)(&board[y][0])) = *((uint4*)(&input[INDEX_NCHW(n, c, y, 0)]));
+            }
+
+            // top-left
+            {
+                half inEl[6][6];
+                // hope compiler will optimize it out
+                for (int i = 0; i < 6; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 6; j++)
+                        inEl[i][j] = 0;
+
+                #pragma unroll
+                for (int i = 0; i < 5; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 5; j++)
+                        inEl[i + 1][j + 1] = board[i][j];
+
+                // ii) transform it
+                inputTransform4x4_gpu(&inEl[0][0], &inEl[0][0]);
+
+                // iii) write to shared memory
+                #pragma unroll
+                for (int y = 0; y < 6; y++)
+                    #pragma unroll
+                    for (int x = 0; x < 6; x++)
+                        shMem[y][x][ln* 4 + 0][lc] = inEl[y][x];
+            }
+
+            // top-right
+            {
+                half inEl[6][6];
+                // hope compiler will optimize it out
+                for (int i = 0; i < 6; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 6; j++)
+                        inEl[i][j] = 0;
+
+                #pragma unroll
+                for (int i = 0; i < 5; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 5; j++)
+                        inEl[i + 1][j] = board[i][j+3];
+
+
+                // ii) transform it
+                inputTransform4x4_gpu(&inEl[0][0], &inEl[0][0]);
+
+                // iii) write to shared memory
+                #pragma unroll
+                for (int y = 0; y < 6; y++)
+                    #pragma unroll
+                    for (int x = 0; x < 6; x++)
+                        shMem[y][x][ln* 4 + 1][lc] = inEl[y][x];
+            }
+
+
+            // bottom-left
+            {
+                half inEl[6][6];
+
+                // hope compiler will optimize it out
+                for (int i = 0; i < 6; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 6; j++)
+                        inEl[i][j] = 0;
+
+                #pragma unroll
+                for (int i = 0; i < 5; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 5; j++)
+                        inEl[i][j + 1] = board[i+3][j];
+
+                // ii) transform it
+                inputTransform4x4_gpu(&inEl[0][0], &inEl[0][0]);
+
+                // iii) write to shared memory
+                #pragma unroll
+                for (int y = 0; y < 6; y++)
+                    #pragma unroll
+                    for (int x = 0; x < 6; x++)
+                        shMem[y][x][ln* 4 + 2][lc] = inEl[y][x];
+            }
+
+            // bottom-right
+            {
+                half inEl[6][6];
+                // hope compiler will optimize it out
+                for (int i = 0; i < 6; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 6; j++)
+                        inEl[i][j] = 0;
+
+                #pragma unroll
+                for (int i = 0; i < 5; i++)
+                    #pragma unroll
+                    for (int j = 0; j < 5; j++)
+                        inEl[i][j] = board[i+3][j+3];
+
+                // ii) transform it
+                inputTransform4x4_gpu(&inEl[0][0], &inEl[0][0]);
+
+                // iii) write to shared memory
+                #pragma unroll
+                for (int y = 0; y < 6; y++)
+                    #pragma unroll
+                    for (int x = 0; x < 6; x++)
+                        shMem[y][x][ln* 4 + 3][lc] = inEl[y][x];
+            }
+        }
+
+
+        __syncthreads();
+
+        // phase 2. Read filter, and perform the matrix-multiplies
+        // 6x6 = 36 work items / 18 warps, each warp does two work items
+
+        int x = warpInBlock % 6;    // 0..5
+        int y = warpInBlock / 6;    // 0..2
+
+        #pragma unroll
+        for (int i = 0; i < 2; i++)
+        {
+            y += i * 3;
+
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> inp[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> filter[2];
+
+            // read input (from shared memory)
+            wmma::load_matrix_sync(inp[0], &(shMem[y][x][0][0]), shPitch);
+            wmma::load_matrix_sync(inp[1], &(shMem[y][x][0][16]), shPitch);
+
+            // read filter (from global memory)
+            // filter is in HWCK layout with H=W=6, and C/K typically 256
+
+            // first 16x16 chunk
+            wmma::load_matrix_sync(filter[0], &(weight[FILTER_IDX_HWCK(y, x, cStart, kStart)]), K);
+            wmma::load_matrix_sync(filter[1], &(weight[FILTER_IDX_HWCK(y, x, cStart + 16, kStart)]), K);
+
+            wmma::mma_sync(out[i][0], inp[0], filter[0], out[i][0]);
+            wmma::mma_sync(out[i][0], inp[1], filter[1], out[i][0]);
+
+            // second 16x16 chunk of work-item
+            wmma::load_matrix_sync(filter[0], &(weight[FILTER_IDX_HWCK(y, x, cStart, kStart+16)]), K);
+            wmma::load_matrix_sync(filter[1], &(weight[FILTER_IDX_HWCK(y, x, cStart + 16, kStart+16)]), K);
+
+            wmma::mma_sync(out[i][1], inp[0], filter[0], out[i][1]);
+            wmma::mma_sync(out[i][1], inp[1], filter[1], out[i][1]);
+        }
+
+        __syncthreads();
+    }   // outer loop for C dimension
+
+    // Phase 3. transform output, perform relu/bias and write to global memory
+
+    // i) write to shared memory
+    int x = warpInBlock % 6;    // 0..5
+    int y = warpInBlock / 6;    // 0..2
+    wmma::store_matrix_sync(&(shMem[y][x][0][0]), out[0][0], shPitch, wmma::mem_row_major);
+    wmma::store_matrix_sync(&(shMem[y][x][0][16]), out[0][1], shPitch, wmma::mem_row_major);
+    y += 3;
+    wmma::store_matrix_sync(&(shMem[y][x][0][0]), out[1][0], shPitch, wmma::mem_row_major);
+    wmma::store_matrix_sync(&(shMem[y][x][0][16]), out[1][1], shPitch, wmma::mem_row_major);
+
+    __syncthreads();
+
+    // Again, similar to Phase 1, only 4 warps (out of 18) active below
+    if (warpInBlock < 4)
+    {
+        for (int hStart = 0; hStart < 8; hStart+=4)
+            for (int wStart = 0; wStart < 8; wStart += 4)
+            {
+                // ii) read from shared memory to per thread registers (for doing output transform)
+                int lk = laneIndex;
+                int ln = warpInBlock;
+                int shln = ln * 4 + (hStart/4)*2 + (wStart/4);
+                half outElTransformed[6][6];
+                #pragma unroll
+                for (int y = 0; y < 6; y++)
+                    #pragma unroll
+                    for (int x = 0; x < 6; x++)
+                        outElTransformed[y][x] = shMem[y][x][shln][lk];
+
+                // ii) transform it
+                half outEl[4][4];
+                outputTransform4x4_gpu(&outEl[0][0], &outElTransformed[0][0]);
+
+                // iii) apply relu and bias
+                half b = bias[kStart + lk];
+                #pragma unroll
+                for (int y = 0; y < 4; y++)
+                    #pragma unroll
+                    for (int x = 0; x < 4; x++)
+                    {
+                        outEl[y][x] += b;
+                        if (relu && outEl[y][x] < (half)0)
+                            outEl[y][x] = 0;
+                    }
+
+                // iv) write to output (use 64 bit writes to store 4 elements a time)
+                int k = kStart + lk;
+                int n = nStart + ln;
+                ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 0, wStart) >> 2] = *((uint2 *)&outEl[0][0]);
+                ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 1, wStart) >> 2] = *((uint2 *)&outEl[1][0]);
+                ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 2, wStart) >> 2] = *((uint2 *)&outEl[2][0]);
+                ((uint2 *)output)[INDEX_NCHW(n, k, hStart + 3, wStart) >> 2] = *((uint2 *)&outEl[3][0]);
+            }
+    }
+
+    // write whole row at a time - actually slower!
+#if 0
+    // Again, similar to Phase 1, only 4 warps (out of 18) active below
+    if (warpInBlock < 4)
+    {
+        half board[8][8];
+
+        int lk = laneIndex;
+        int ln = warpInBlock;
+
+        for (int hStart = 0; hStart < 8; hStart+=4)
+            for (int wStart = 0; wStart < 8; wStart += 4)
+            {
+                // ii) read from shared memory to per thread registers (for doing output transform)
+                int shln = ln * 4 + (hStart / 4) * 2 + (wStart / 4);
+                half outElTransformed[6][6];
+                #pragma unroll
+                for (int y = 0; y < 6; y++)
+                    #pragma unroll
+                    for (int x = 0; x < 6; x++)
+                        outElTransformed[y][x] = shMem[y][x][shln][lk];
+
+                // ii) transform it
+                half outEl[4][4];
+                outputTransform4x4_gpu(&outEl[0][0], &outElTransformed[0][0]);
+
+                #pragma unroll
+                for (int y = 0; y < 4; y++)
+                    #pragma unroll
+                    for (int x = 0; x < 4; x++)
+                        board[hStart+y][wStart+x] = outEl[y][x];
+            }
+
+        // iii) apply relu and bias
+        half b = bias[kStart + lk];
+        #pragma unroll
+        for (int y = 0; y < 8; y++)
+            #pragma unroll
+            for (int x = 0; x < 8; x++)
+            {
+                board[y][x] += b;
+                if (relu && board[y][x] < (half)0)
+                    board[y][x] = 0;
+            }
+
+
+        // iv) write to output (use 128 bit writes to store one row a time)
+        int k = kStart + lk;
+        int n = nStart + ln;
+        #pragma unroll
+        for (int y = 0; y < 8; y++)
+        {
+            //((uint4 *)output)[INDEX_NCHW(n, k, y, 0) >> 4] = *((uint4 *)&board[y][0]);
+            *((uint4*)(&output[INDEX_NCHW(n, k, y, 0)])) = *((uint4 *)&board[y][0]);
+        }
+    }
+#endif
+}
+
+// weight contains transformed filter (6x6xCxK layout)
+template<int N, int K, int C>
+void convCudaWinograd_fp16_NCHW(half *output, const half *input, const half *weight, const half *bias, bool relu)
+{
+    // Each thread block writes 4 elements in N dimension, and 32 elements in K dimension (and entire spatial dimension)
+    // and 4x4 elements in spatial dimensions (H x W)
+    static_assert(K % 32 == 0, "unsupported K dim");
+    static_assert(N % 4 == 0, "unsupported N dim");
+
+    dim3 gridDim(K / 32, N / 4);
 
     // each thread block is 18 warps = 576 threads
     dim3 blockDim(32, 18);
