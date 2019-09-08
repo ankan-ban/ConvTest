@@ -739,9 +739,9 @@ void convTest_Winograd4x4Matmul(T *output, const T *input, const T *weight, cons
        orig size            +   transformed size
       (256 * 256 * 8 * 8)   +  (256 * 256 * 12 * 12)
 
-    2. Mat mul (sizes of transformed input and output and tensor):
+    2. Mat mul (sizes of transformed input, output and filter):
       (256 * 256 * 12 * 12) * 3
-      Note: Tensor is smaller 256x256x6x6 but is unlikely to be re-used across batched-gemms?
+      Note: filter is smaller 256x256x6x6 but is unlikely to be re-used across batched-gemms?
 
     3. Output transform (same memory requirment as input transform):
       transformed size      +   orig size
