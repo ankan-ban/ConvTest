@@ -4185,9 +4185,12 @@ void convCudaWinograd_fp16_NCHW_NonFused(half *output, const half *input, const 
     //static_assert(K % 32 == 0, "unsupported K dim");
     //static_assert(N % 4 == 0, "unsupported N dim");
 
-    cudaEvent_t start, stop;
+    cudaEvent_t start, transformDone, gemmDone, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
+    cudaEventCreate(&transformDone);
+    cudaEventCreate(&gemmDone);
+
 
     half *transformedInput, *transformedOutput;
     const int transformedInputSize = 6 * 6 * GemmN*C * sizeof(half);
@@ -4202,44 +4205,59 @@ void convCudaWinograd_fp16_NCHW_NonFused(half *output, const half *input, const 
     cublasSetMathMode(cublas, CUBLAS_TENSOR_OP_MATH);
 #endif
 
-    for (int i = 0; i < loops * 2; i++)
-    {
-        if (i == loops)
-            cudaEventRecord(start, NULL);
+    //const int loops = 1;  // test!
 
+    cudaEventRecord(start, NULL);
+
+    for (int i=0;i<loops;i++)
         InputTransform<N, C> <<<N, C>>> (input, transformedInput);
 
-        // Our custom cuda kernel using WMMA is faster than CUBLAS!
+    cudaEventRecord(transformDone, NULL);
+
+    // Our custom cuda kernel using WMMA is faster than CUBLAS!
 #if USE_CUBLAS == 1
+    for (int i = 0; i < loops; i++)
         cublasRowMjaorMatrixMul(transformedInput, weight, transformedOutput, GemmN, K, C, 36, cublas);
 #else
 
-        dim3 blockDim(32, K/(tilesK*16));
-        dim3 gridDim(GemmN/(tilesN*16), 6, 6);
+    dim3 blockDim(32, K/(tilesK*16));
+    dim3 gridDim(GemmN/(tilesN*16), 6, 6);
+    for (int i = 0; i < loops; i++)
         WinogradGemm<N, K, C> << <gridDim, blockDim >>> (transformedInput, weight, transformedOutput);
 #endif
 
-        OutputTransform<N, K> <<<N, K>>>(transformedOutput, output, bias, relu);
+    cudaEventRecord(gemmDone, NULL);
 
-        //convKernel_fp16_winograd<K, C> << <gridDim, blockDim >> > (output, input, weight, bias, relu);
-        if (i == 0)
-        {
-            cudaDeviceSynchronize();
-            cudaError err = cudaGetLastError();
-            if (err != cudaSuccess)
-            {
-                printf("\nCUDA ERROR: %s\n", cudaGetErrorString(err));
-            }
-        }
-    }
+    for (int i = 0; i < loops; i++)
+        OutputTransform<N, K> <<<N, K>>>(transformedOutput, output, bias, relu);
 
     cudaEventRecord(stop, NULL);
     cudaEventSynchronize(stop);
 
     float msecTotal = 0.0f;
     cudaEventElapsedTime(&msecTotal, start, stop);
-    double TFlops = (2.0 * N * 8 * 8 * K * C * 3 * 3 * loops) / (msecTotal * 1000000000.0);
-    printf("CUDA nonfused winograd: Time: %gms, TFlops: %g\n\n", msecTotal / loops, TFlops);
+
+    float msecInputTransform = 0.0f;
+    cudaEventElapsedTime(&msecInputTransform, start, transformDone);
+
+    float msecGemm = 0.0f;
+    cudaEventElapsedTime(&msecGemm, transformDone, gemmDone);
+
+    float msecOutputTransform = 0.0f;
+    cudaEventElapsedTime(&msecOutputTransform, gemmDone, stop);
+
+    double TFlopsTotal = (2.0 * N * 8 * 8 * K * C * 3 * 3 * loops) / (msecTotal * 1000000000.0);
+    printf("CUDA nonfused winograd: Time: %gms, TFlops: %g\n", msecTotal / loops, TFlopsTotal);
+
+    double GbpsInputTransform = ((N * C * 8 * 8 + N * C * 12 * 12.0) * sizeof(half) * loops) / (msecInputTransform * 1000000.0);
+    printf("InputTransform: Time: %gms, GBps: %g\n", msecInputTransform / loops, GbpsInputTransform);
+
+    double GbpsOutputTransform = ((N * K * 8 * 8 + N * K * 12 * 12.0) * sizeof(half) * loops) / (msecOutputTransform * 1000000.0);
+    printf("OutputTransform: Time: %gms, GBps: %g\n", msecOutputTransform / loops, GbpsOutputTransform);
+
+    double GbpsGemm = ((C * K * 6 * 6 + N * K * 12 * 12.0 + N * C * 12 * 12.0) * sizeof(half) * loops) / (msecGemm * 1000000.0);
+    double TFlopsGemm = (2.0 * 36 * (GemmN) * K * C * loops) / (msecTotal * 1000000000.0);
+    printf("Gemm: Time: %gms, GBps: %g, TFlops: %g\n\n", msecGemm / loops, GbpsGemm, TFlopsGemm);
 
 }
 
