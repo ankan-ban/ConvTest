@@ -4256,7 +4256,7 @@ void convCudaWinograd_fp16_NCHW_NonFused(half *output, const half *input, const 
     printf("OutputTransform: Time: %gms, GBps: %g\n", msecOutputTransform / loops, GbpsOutputTransform);
 
     double GbpsGemm = ((C * K * 6 * 6 + N * K * 12 * 12.0 + N * C * 12 * 12.0) * sizeof(half) * loops) / (msecGemm * 1000000.0);
-    double TFlopsGemm = (2.0 * 36 * (GemmN) * K * C * loops) / (msecTotal * 1000000000.0);
+    double TFlopsGemm = (2.0 * 36 * (GemmN) * K * C * loops) / (msecGemm * 1000000000.0);
     printf("Gemm: Time: %gms, GBps: %g, TFlops: %g\n\n", msecGemm / loops, GbpsGemm, TFlopsGemm);
 
 }
