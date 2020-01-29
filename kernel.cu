@@ -9,6 +9,10 @@
 #include <cstdio>
 #include <cstdlib>
 
+#define CPU_RUN 1
+#define CUDNN_RUN 0
+
+
 // OpenMP to quickly speed up cpu conv
 #include <omp.h>
 
@@ -4205,6 +4209,12 @@ void convCudaWinograd_fp16_NCHW_NonFused(half *output, const half *input, const 
     cublasSetMathMode(cublas, CUBLAS_TENSOR_OP_MATH);
 #endif
 
+
+    // warm-up
+    for (int i = 0; i < 2*loops; i++)
+        InputTransform<N, C> << <N, C >> > (input, transformedInput);
+
+
     //const int loops = 1;  // test!
 
     cudaEventRecord(start, NULL);
@@ -4358,7 +4368,7 @@ int main()
 
     // convolution using cpu ref
     void *crefop = malloc(outputBytes);
-#if 1
+#if CPU_RUN == 1
     if (fp16)
     {
         // buggy: convTest_Winograd4x4Matmul<N, K, C, H, W, F, F>((half*)crefop, (half*)cinput, (half*)cfilter, (half*)cbias, true);
@@ -4373,7 +4383,7 @@ int main()
     }
 #endif
 
-#if 1
+#if CUDNN_RUN == 1
     // convolution using cudnn
     if (fp16)
     {
@@ -4402,8 +4412,9 @@ int main()
 
     cudaMemcpy(coutput, output, outputBytes, cudaMemcpyDeviceToHost);
 
-
+#if CPU_RUN == 1
     compareResults(coutput, crefop, outputElements, fp16);
+#endif
 
     cudaFree(input);
     cudaFree(output);
