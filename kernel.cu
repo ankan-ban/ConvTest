@@ -8,24 +8,40 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
+#include <algorithm>
 
-#define CPU_RUN 1
+#define CPU_RUN 0
 #define CUDNN_RUN 0
+#define PER_LAYER_TIMING 1
+
+constexpr int loops = 10000;
+
+constexpr int N = 128;
+constexpr int C = 512;
+constexpr int K = 512;
 
 
 // OpenMP to quickly speed up cpu conv
 #include <omp.h>
 
 // cublas for the batched winograd gemm
-//  - its slower than our custom WMMA gemm!
 #define USE_CUBLAS 0
 
-#if USE_CUBLAS == 1
-#include <cublas_v2.h>
+// cutlass for the batched winograd GEMM
+#define USE_CUTLASS 1
+
+#if USE_CUTLASS == 1
+#include "cutlass/cutlass.h"
+#include "cutlass/layout/matrix.h"
+#include "cutlass/gemm/device/gemm_array.h"
+#include "cutlass/gemm/device/gemm_batched.h"
+#elif USE_CUBLAS == 1
+//#include <cublas_v2.h>
+#include <cublasLt.h>
 #endif
 
 
-constexpr int loops = 1000;
 
 
 #define INDEX_NCHW(n,c,h,w) ((n)*C*H*W + (c)*H*W + (h)*W + w)
@@ -4161,8 +4177,103 @@ __global__ void OutputTransform(const half *input, half *output, const half *bia
     }
 }
 
-#if USE_CUBLAS == 1
-void cublasRowMjaorMatrixMul(const half *A, const half* B, half *Out, int M, int N, int K, int batchSize, cublasHandle_t cublas)
+#if USE_CUTLASS == 1
+void cutlassRowMjaorMatrixMul(const half* A, const half* B, half* Out, int M, int N, int K, int batchSize)
+{
+    half halfOne = (half)1.0f;
+    half halfZero = (half)0.0f;
+
+    using ElementAccumulator = cutlass::half_t;         // <- data type of accumulator
+    using ElementComputeEpilogue = ElementAccumulator;  // <- data type of epilogue operations
+    using ElementInputA = cutlass::half_t;              // <- data type of elements in input matrix A
+    using ElementInputB = cutlass::half_t;              // <- data type of elements in input matrix B
+    using ElementOutput = cutlass::half_t;                        // <- data type of elements in output matrix D
+    using LayoutInputA = cutlass::layout::RowMajor;
+    using LayoutInputB = cutlass::layout::RowMajor;
+    using LayoutOutput = cutlass::layout::RowMajor;
+    using MMAOp = cutlass::arch::OpClassTensorOp;
+
+    // This code section describes CUDA SM architecture number
+    using SmArch = cutlass::arch::Sm80;
+
+    // This code section describes the tile size a thread block will compute
+    using ShapeMMAThreadBlock =
+        cutlass::gemm::GemmShape<128, 128, 32>;  // <- threadblock tile M = 128, N = 128, K = 32
+        // This code section describes tile size a warp will compute
+    using ShapeMMAWarp = cutlass::gemm::GemmShape<32, 64, 32>;  // <- warp tile M = 64, N = 64, K = 32 
+    // This code section describes the size of MMA op
+    using ShapeMMAOp = cutlass::gemm::GemmShape<16, 8, 16>;  // <- MMA Op tile M = 8, N = 8, K = 4
+
+    // This code section describes how threadblocks are scheduled on GPU
+    using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;  // <- ??
+
+    // This code section describes ?
+    using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+        ElementOutput,                                     // <- data type of output matrix
+        128 / cutlass::sizeof_bits<ElementOutput>::value,  // <- this is the number of elements per
+                                                           // vectorized memory access. For half
+                                                           // precision, it's 8 elements. This becomes
+                                                           // the vector width of math instructions in
+                                                           // epilogue too
+        ElementAccumulator,                                // <- data type of accumulator
+        float>;                                            // <- data type for alpha/beta in linear combination function
+
+    constexpr int NumStages = 3;        // stages == 2/4 is also good sometimes
+
+    using Gemm = cutlass::gemm::device::GemmBatched<ElementInputA,
+        LayoutInputA,
+        ElementInputB,
+        LayoutInputB,
+        ElementOutput,
+        LayoutOutput,
+        ElementAccumulator,
+        MMAOp,
+        SmArch,
+        ShapeMMAThreadBlock,
+        ShapeMMAWarp,
+        ShapeMMAOp,
+        EpilogueOp,
+        SwizzleThreadBlock,
+        NumStages>;
+
+    Gemm gemm_op;
+
+    cutlass::Status status = gemm_op({
+      {M, N, K},
+      {(cutlass::half_t const*)A, K},
+      K*M,
+      {(cutlass::half_t const*)B, N},
+      N*K,
+      {(cutlass::half_t const*)Out, N},
+      N*M,
+      {(cutlass::half_t *)Out, N},
+      N* M,
+      {halfOne, halfZero},
+      batchSize
+        });
+}
+    
+
+#elif USE_CUBLAS == 1
+
+float median(std::vector<float>& times) {
+    const size_t size = times.size();
+    if (size == 0) {
+        return 0;
+    }
+
+    std::sort(times.begin(), times.end());
+
+    const size_t mid = size / 2;
+    if (size % 2 == 0) {
+        return (times[mid] + times[mid - 1]) / 2;
+    }
+    else {
+        return times[mid];
+    }
+}
+
+void cublasRowMjaorMatrixMul(const half *A, const half* B, half *Out, int M, int N, int K, int batchSize, /*cublasHandle_t*/ cublasLtHandle_t cublas)
 {
     half halfOne = (half) 1.0f;
     half halfZero = (half) 0.0f;
@@ -4175,7 +4286,129 @@ void cublasRowMjaorMatrixMul(const half *A, const half* B, half *Out, int M, int
     // to multiply row major matrices, use the trick described here
     // https://www.christophlassner.de/using-blas-from-c-with-row-major-data.html
 
-    cublasHgemmStridedBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &halfOne, B, N, N*K, A, K, K*M, &halfZero, Out, N, N*M, batchSize);
+    //cublasHgemmStridedBatched(cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &halfOne, B, N, N*K, A, K, K*M, &halfZero, Out, N, N*M, batchSize);
+
+    //cublasGemmStridedBatchedEx(cublas, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &halfOne, B, CUDA_R_16F, N, N * K, A, CUDA_R_16F, K, K * M, &halfZero, 
+    //   Out, CUDA_R_16F, N, N * M, batchSize, CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    cublasOperation_t noTranspose = CUBLAS_OP_N;
+
+    cublasLtMatmulDesc_t operationDesc = NULL;
+    cublasLtMatrixLayout_t Adesc = NULL, Bdesc = NULL, Cdesc = NULL;
+
+    cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_16F, CUDA_R_16F);
+    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &noTranspose, sizeof(noTranspose));
+    cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &noTranspose, sizeof(noTranspose));
+
+    int64_t strideA = N * K;
+    int64_t strideB = K * M;
+    int64_t strideC = N * M;
+
+    cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_16F, N, K, N);
+    cublasLtMatrixLayoutSetAttribute(Adesc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batchSize, sizeof(batchSize));
+    cublasLtMatrixLayoutSetAttribute(Adesc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideA, sizeof(strideA));
+
+    cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_16F, K, M, K);
+    cublasLtMatrixLayoutSetAttribute(Bdesc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batchSize, sizeof(batchSize));
+    cublasLtMatrixLayoutSetAttribute(Bdesc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideB, sizeof(strideB));
+
+
+    cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16F, N, M, N);
+    cublasLtMatrixLayoutSetAttribute(Cdesc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batchSize, sizeof(batchSize));
+    cublasLtMatrixLayoutSetAttribute(Cdesc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &strideC, sizeof(strideC));
+
+#if 0
+    static int foundAlgo = 0;
+    static cublasLtMatmulAlgo_t BestAlgo;
+
+    if (!foundAlgo)
+    {
+
+        cublasLtMatmulPreference_t preference = NULL;
+        size_t maxWorkspace = 1024 * 1024 * 1024;
+        cublasLtMatmulPreferenceCreate(&preference);
+        cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &maxWorkspace, sizeof(maxWorkspace));
+
+        cublasLtMatmulHeuristicResult_t heuristicResult[32] = { 0 };
+        int numAlgos = 0;
+        cublasLtMatmulAlgoGetHeuristic(cublas, operationDesc, Adesc, Bdesc, Cdesc, Cdesc, preference,
+            32, heuristicResult, &numAlgos);
+
+        printf("\n\number of algorithms found: %d", numAlgos);
+
+        cudaEvent_t startEvent, stopEvent;
+        cudaEventCreate(&startEvent);
+        cudaEventCreate(&stopEvent);
+        float time = 0;
+        float bestAlgoTime = 0;
+        int bestAlgoIdx;
+        constexpr int repeatAlgoCheck = 100;
+        std::vector<float> algoTimes(repeatAlgoCheck);
+
+        for (int algoIdx = 0; algoIdx < numAlgos; algoIdx++) {
+            for (int checkIdx = 0; checkIdx < repeatAlgoCheck; checkIdx++) {
+                cudaEventRecord(startEvent, 0);
+
+
+                cublasLtMatmul(cublas,
+                    operationDesc,
+                    &halfOne,
+                    B,
+                    Adesc,
+                    A,
+                    Bdesc,
+                    &halfZero,
+                    nullptr,
+                    Cdesc,
+                    Out,
+                    Cdesc,
+                    &heuristicResult[algoIdx].algo,
+                    Out,
+                    1024 * 1024 * 1024,
+                    0);
+
+                cudaEventRecord(stopEvent, 0);
+                cudaEventSynchronize(stopEvent);
+                cudaEventElapsedTime(&time, startEvent, stopEvent);
+                algoTimes[checkIdx] = time;
+            }
+
+            time = median(algoTimes);
+            printf("\n%d: %f\n", algoIdx, time);
+
+            if (algoIdx == 0 || time < bestAlgoTime) {
+                bestAlgoTime = time;
+                bestAlgoIdx = algoIdx;
+            }
+        }
+
+        foundAlgo = 1;
+        memcpy(&BestAlgo, &heuristicResult[bestAlgoIdx].algo, sizeof(BestAlgo));
+    }
+
+#endif
+    cublasLtMatmul(cublas,
+        operationDesc,
+        &halfOne,
+        B,
+        Adesc,
+        A,
+        Bdesc,
+        &halfZero,
+        nullptr,
+        Cdesc,
+        Out,
+        Cdesc,
+        /*&BestAlgo*/ nullptr,
+        nullptr,
+        0,
+        0);
+
+    if (Cdesc) cublasLtMatrixLayoutDestroy(Cdesc);
+    if (Bdesc) cublasLtMatrixLayoutDestroy(Bdesc);
+    if (Adesc) cublasLtMatrixLayoutDestroy(Adesc);
+    if (operationDesc) cublasLtMatmulDescDestroy(operationDesc);
 }
 #endif
 
@@ -4203,10 +4436,13 @@ void convCudaWinograd_fp16_NCHW_NonFused(half *output, const half *input, const 
     cudaMalloc(&transformedInput, transformedInputSize);
     cudaMalloc(&transformedOutput, transformedOutputSize);
 
+
+
+
 #if USE_CUBLAS == 1
-    cublasHandle_t cublas;
-    cublasCreate(&cublas);
-    cublasSetMathMode(cublas, CUBLAS_TENSOR_OP_MATH);
+    cublasLtHandle_t cublas;
+    cublasLtCreate(&cublas);
+    //cublasSetMathMode(cublas, CUBLAS_TENSOR_OP_MATH);
 #endif
 
 
@@ -4219,27 +4455,45 @@ void convCudaWinograd_fp16_NCHW_NonFused(half *output, const half *input, const 
 
     cudaEventRecord(start, NULL);
 
-    for (int i=0;i<loops;i++)
-        InputTransform<N, C> <<<N, C>>> (input, transformedInput);
+#if PER_LAYER_TIMING
+    for (int i = 0; i < loops; i++)
+        InputTransform<N, C> << <N, C >> > (input, transformedInput);
 
     cudaEventRecord(transformDone, NULL);
 
-    // Our custom cuda kernel using WMMA is faster than CUBLAS!
-#if USE_CUBLAS == 1
+    // For our custom cuda kernel using WMMA
+    dim3 blockDim(32, K / (tilesK * 16));
+    dim3 gridDim(GemmN / (tilesN * 16), 6, 6);
+
     for (int i = 0; i < loops; i++)
+#if USE_CUTLASS == 1
+        cutlassRowMjaorMatrixMul(transformedInput, weight, transformedOutput, GemmN, K, C, 36);
+#elif USE_CUBLAS == 1
         cublasRowMjaorMatrixMul(transformedInput, weight, transformedOutput, GemmN, K, C, 36, cublas);
 #else
-
-    dim3 blockDim(32, K/(tilesK*16));
-    dim3 gridDim(GemmN/(tilesN*16), 6, 6);
-    for (int i = 0; i < loops; i++)
-        WinogradGemm<N, K, C> << <gridDim, blockDim >>> (transformedInput, weight, transformedOutput);
+        WinogradGemm<N, K, C> << <gridDim, blockDim >> > (transformedInput, weight, transformedOutput);
 #endif
 
     cudaEventRecord(gemmDone, NULL);
 
     for (int i = 0; i < loops; i++)
-        OutputTransform<N, K> <<<N, K>>>(transformedOutput, output, bias, relu);
+        OutputTransform<N, K> << <N, K >> > (transformedOutput, output, bias, relu);
+#else
+    for (int i = 0; i < loops; i++)
+    {
+        InputTransform<N, C> << <N, C >> > (input, transformedInput);
+#if USE_CUTLASS == 1
+        cutlassRowMjaorMatrixMul(transformedInput, weight, transformedOutput, GemmN, K, C, 36);
+#elif USE_CUBLAS == 1
+        cublasRowMjaorMatrixMul(transformedInput, weight, transformedOutput, GemmN, K, C, 36, cublas);
+#else
+        dim3 blockDim(32, K / (tilesK * 16));
+        dim3 gridDim(GemmN / (tilesN * 16), 6, 6);
+        WinogradGemm<N, K, C> << <gridDim, blockDim >> > (transformedInput, weight, transformedOutput);
+#endif
+        OutputTransform<N, K> << <N, K >> > (transformedOutput, output, bias, relu);
+    }
+#endif
 
     cudaEventRecord(stop, NULL);
     cudaEventSynchronize(stop);
@@ -4259,6 +4513,7 @@ void convCudaWinograd_fp16_NCHW_NonFused(half *output, const half *input, const 
     double TFlopsTotal = (2.0 * N * 8 * 8 * K * C * 3 * 3 * loops) / (msecTotal * 1000000000.0);
     printf("CUDA nonfused winograd: Time: %gms, TFlops: %g\n", msecTotal / loops, TFlopsTotal);
 
+#if PER_LAYER_TIMING
     double GbpsInputTransform = ((N * C * 8 * 8 + N * C * 12 * 12.0) * sizeof(half) * loops) / (msecInputTransform * 1000000.0);
     printf("InputTransform: Time: %gms, GBps: %g\n", msecInputTransform / loops, GbpsInputTransform);
 
@@ -4268,7 +4523,7 @@ void convCudaWinograd_fp16_NCHW_NonFused(half *output, const half *input, const 
     double GbpsGemm = ((C * K * 6 * 6 + N * K * 12 * 12.0 + N * C * 12 * 12.0) * sizeof(half) * loops) / (msecGemm * 1000000.0);
     double TFlopsGemm = (2.0 * 36 * (GemmN) * K * C * loops) / (msecGemm * 1000000000.0);
     printf("Gemm: Time: %gms, GBps: %g, TFlops: %g\n\n", msecGemm / loops, GbpsGemm, TFlopsGemm);
-
+#endif
 }
 
 int main()
@@ -4298,11 +4553,7 @@ int main()
 #endif
 
     constexpr bool fp16 = true;
-    
-    constexpr int N = 256;
-    //constexpr int N = 16;
-    constexpr int C = 256;
-    constexpr int K = 256;
+   
     constexpr int H = 8;
     constexpr int W = 8;
     constexpr int F = 3;
